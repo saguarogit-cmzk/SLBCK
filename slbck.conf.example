@@ -60,7 +60,8 @@ REMOTE_USER=""
 REMOTE_PATH=""
 # Subfolder on the remote so multiple servers can share one target:
 # auto = short hostname of this server, empty = none, or a custom name.
-REMOTE_SUBDIR="auto"
+# (Empty keeps the remote path identical to pre-1.3 versions.)
+REMOTE_SUBDIR=""
 # Optional SSH private key; empty = root's default key. Key auth must already
 # work non-interactively (ssh-copy-id) - SLBCK never stores SSH passwords.
 SSH_KEY=""

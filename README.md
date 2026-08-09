@@ -87,12 +87,21 @@ Sve opcije rade i direktno iz CLI-ja (za skriptiranje):
   sam dropne i ponovno kreira bazu (aktivne konekcije se prije toga prekidaju).
   Za role/tablespaceove postoji poseban `_globals` dump.
 
-Ručni restore (bez SLBCK-a) uvijek radi jer su dumpovi običan gzipani SQL:
+### Direktan pristup dumpovima (bez SLBCK-a)
+
+Po defaultu (enkripcija isključena) dumpovi su **običan gzipani SQL** — do
+svake baze dolaziš standardnim alatima, SLBCK ti uopće ne treba:
 
 ```bash
-zcat baza.sql.gz | mysql                      # MySQL/MariaDB
-zcat baza.sql.gz | sudo -u postgres psql -d postgres   # PostgreSQL
+zcat /var/backups/slbck/2026-08-09/webshop.sql.gz | less        # pogledaj
+gunzip -k /var/backups/slbck/2026-08-09/webshop.sql.gz          # dobij .sql
+zcat webshop.sql.gz | grep 'INSERT INTO `orders`'               # jedna tablica
+zcat webshop.sql.gz | mysql                                     # puni restore
+zcat webshop.sql.gz | sudo -u postgres psql -d postgres         # PostgreSQL
 ```
+
+Ako je GPG enkripcija uključena, isti pristup radi uz jedan korak više
+(i passphrase): `gpg -d baza.sql.gz.gpg | gunzip | less`.
 
 ## Kako radi backup
 

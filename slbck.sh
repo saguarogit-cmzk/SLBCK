@@ -39,7 +39,10 @@ REMOTE_HOST=""
 REMOTE_PORT="22"
 REMOTE_USER=""
 REMOTE_PATH=""
-REMOTE_SUBDIR="auto"        # auto = short hostname, empty = none, or custom name
+# Subfolder on the remote. Built-in default is EMPTY (none) so configs from
+# older versions keep their remote path unchanged; the setup wizard suggests
+# "auto" (= short hostname) for new setups so servers can share one target.
+REMOTE_SUBDIR=""
 SSH_KEY=""                  # optional private key path
 MYSQL_USER=""               # empty = socket auth (root)
 MYSQL_PASS=""
@@ -1023,8 +1026,9 @@ cmd_setup() {
         ask "Remote SSH port" "$REMOTE_PORT";        REMOTE_PORT="$REPLY"
         ask "Remote user" "$REMOTE_USER";            REMOTE_USER="$REPLY"
         ask "Remote path" "$REMOTE_PATH";            REMOTE_PATH="$REPLY"
-        ask "Subfolder per server (auto = hostname '$(hostname -s)', empty = none)" "$REMOTE_SUBDIR"
+        ask "Subfolder per server (auto = hostname '$(hostname -s)', none = no subfolder)" "${REMOTE_SUBDIR:-auto}"
         REMOTE_SUBDIR="$REPLY"
+        [ "$REMOTE_SUBDIR" = "none" ] && REMOTE_SUBDIR=""
         ask "SSH private key (empty = default root key)" "$SSH_KEY"
         SSH_KEY="$REPLY"
         echo "NOTE: key-based SSH auth must already work from this server (ssh-copy-id)."
