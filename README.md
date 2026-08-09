@@ -11,14 +11,17 @@ Ubuntuu, RHEL/Alma/Rocky i sličnima.
    (`/var/backups/slbck/YYYY-MM-DD/baza.sql.gz`)
 3. Drži zadnja **3 dana** lokalno (podesivo), starije automatski briše
 4. Opcionalno šalje backup na vanjski server (**rsync** ili **sftp** preko SSH ključa)
-5. **Restore** bilo koje baze iz lokalnih backupa ili povlačenjem s remote servera
-6. **Tjedni restore test s potvrdom** — stvarno restora jednu bazu u privremenu
+5. **Backup foldera**: mali folderi (npr. `/etc`) kao dnevni tar.gz uz baze,
+   veliki folderi (npr. `/var/www`) kao rsync mirror **direktno na remote**
+   bez lokalne kopije, s kontrolom veličine u mailu
+6. **Restore** bilo koje baze iz lokalnih backupa ili povlačenjem s remote servera
+7. **Tjedni restore test s potvrdom** — stvarno restora jednu bazu u privremenu
    DB, prebroji tablice, obriše je i rezultat pošalje mailom
-7. Opcionalna **GPG AES256 enkripcija** dumpova (lokalno i na remoteu)
-8. Šalje **mail obavijest** o uspjehu ili grešci — ako server nema mail sustav,
+8. Opcionalna **GPG AES256 enkripcija** dumpova (lokalno i na remoteu)
+9. Šalje **mail obavijest** o uspjehu ili grešci — ako server nema mail sustav,
    setup ga sam instalira i podesi (msmtp SMTP relay)
-9. Vrti se kao **cron job** u fiksno vrijeme (izbor 01:00–06:00), log se
-   rotira kroz logrotate, disk se provjerava prije svakog backupa
+10. Vrti se kao **cron job** u fiksno vrijeme (izbor 01:00–06:00), log se
+    rotira kroz logrotate, disk se provjerava prije svakog backupa
 
 ## Instalacija
 
@@ -149,6 +152,52 @@ Ručno bilo kada: `slbck verify` (uvijek šalje mail potvrdu, OK ili ERROR).
   postoji — pogotovo u disaster scenariju kad server (i config) više nema.
 - Ručni restore enkriptiranog dumpa:
   `gpg -d baza.sql.gz.gpg | gunzip | mysql`
+
+## Backup foldera (uz baze)
+
+Dva načina, oba se uključuju u setupu — **kako složiti foldere:**
+
+### 1. ARCHIVE — mali folderi (configi, npr. `/etc`)
+
+U setupu na pitanje *"Folders to archive daily"* upišeš popis odvojen
+razmakom, npr. `/etc /root` (ili kasnije u `/etc/slbck/slbck.conf`:
+`ARCHIVE_DIRS="/etc /root"`). Svaki dan nastaje `_files-etc.tar.gz` u
+dnevnom folderu **uz dumpove baza** — dobiva istu retenciju, isti mirror na
+remote, istu enkripciju i ulazi u tjedni verify. Drži ovo malim (MB, ne GB).
+
+Restore: `tar xzf _files-etc.tar.gz -C /tmp/restore-etc` pa ručno vrati što
+treba (nikad tar direktno preko živog `/etc`).
+
+### 2. MIRROR — veliki folderi (`/var/www`, dokumenti...)
+
+**Nikad se ne spremaju lokalno** — rsync ide direktno s diska na remote u
+`<path>/<server>/folders/var-www/`. Povijest verzija daju **snapshotovi
+Storage Boxa** (obavezno ih uključi u Robot panelu).
+
+Popis foldera: `/etc/slbck/folders.conf` — jedan apsolutni path po retku:
+
+```
+# /etc/slbck/folders.conf
+/var/www
+/home/data/dokumenti
+```
+
+Excludovi (vrijede za sve foldere): `/etc/slbck/folder-excludes.conf` —
+rsync patterni, po defaultu već isključuje `node_modules/`, `cache/`,
+`*.tmp`. Nakon uređivanja testiraj s `sudo slbck backup`.
+
+Kontrola veličine: mail javlja veličinu svakog foldera, a preko
+`FOLDERS_MAX_GB` (default 50) dobiješ WARNING — odmah vidiš kad nešto
+naraste. Mirror = na remoteu je uvijek 1× stvarna veličina foldera, prijenos
+je inkrementalan (samo promjene).
+
+Restore foldera (ručno, natrag s remotea):
+
+```bash
+rsync -az -e "ssh -p23" uXXXXX@uXXXXX.your-storagebox.de:backup/srv01/folders/var-www/ /var/www/
+```
+
+Starija verzija fajla → uzmi je iz snapshot direktorija Storage Boxa.
 
 ## Remote kopija
 

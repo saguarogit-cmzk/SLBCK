@@ -32,6 +32,18 @@ ENCRYPT_PASSPHRASE=''
 VERIFY_ENABLED="yes"
 VERIFY_DAY="7"          # 1=Mon .. 7=Sun
 
+# --- Folder backup ----------------------------------------------------------
+# ARCHIVE: small folders (e.g. /etc) -> daily tar.gz stored WITH the DB dumps
+# (same retention, mirror, encryption, verify). Space separated. Keep small!
+ARCHIVE_DIRS="/etc"
+# MIRROR: big folders (e.g. /var/www) rsynced DIRECTLY to the remote server,
+# never stored locally. List them in /etc/slbck/folders.conf (one per line),
+# excludes in /etc/slbck/folder-excludes.conf. Requires REMOTE_METHOD=rsync.
+# History/versions come from Storage Box snapshots - enable them!
+FOLDERS_ENABLED="no"
+# Warn in the mail when a mirrored folder exceeds this size
+FOLDERS_MAX_GB="50"
+
 # --- E-mail notifications ---------------------------------------------------
 # If the server has no mail transport, 'slbck setup' offers to install and
 # configure msmtp (lightweight SMTP relay) automatically.

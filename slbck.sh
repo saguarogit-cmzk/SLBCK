@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.3.0"
+VERSION="1.4.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -51,6 +51,17 @@ ENCRYPT_ENABLED="no"        # yes = gpg AES256 symmetric encryption of dumps
 ENCRYPT_PASSPHRASE=""       # min 12 chars; ALSO STORE IT IN YOUR PASSWORD MANAGER
 VERIFY_ENABLED="yes"        # weekly automatic restore test
 VERIFY_DAY="7"              # 1=Mon .. 7=Sun (day when restore test runs)
+
+# Folder backup:
+# - ARCHIVE (small folders, e.g. /etc): daily tar.gz stored WITH the DB dumps,
+#   so it gets the same retention, mirror, encryption and verify.
+# - MIRROR (big folders, e.g. /var/www): rsynced DIRECTLY to the remote server,
+#   never stored locally. History comes from Storage Box snapshots.
+ARCHIVE_DIRS=""             # space separated, e.g. "/etc /root"
+FOLDERS_ENABLED="no"        # yes = mirror folders from folders.conf to remote
+FOLDERS_MAX_GB="50"         # warn in mail when a mirrored folder exceeds this
+FOLDERS_FILE="$CONFIG_DIR/folders.conf"
+FOLDER_EXCLUDES_FILE="$CONFIG_DIR/folder-excludes.conf"
 
 [ -f "$CONFIG" ] && . "$CONFIG"
 
@@ -420,8 +431,10 @@ remote_send() {
     case "$REMOTE_METHOD" in
         rsync)
             if ! command -v rsync >/dev/null 2>&1; then fail "rsync is not installed."; return 1; fi
-            # Mirror local backup dir (local retention == remote retention)
-            if rsync -az --delete -e "ssh $ssh_opts" \
+            # Mirror local backup dir (local retention == remote retention).
+            # /folders on the remote belongs to folders_mirror - protect it
+            # from --delete.
+            if rsync -az --delete --exclude='/folders' -e "ssh $ssh_opts" \
                 "$BACKUP_DIR/" "$REMOTE_USER@$REMOTE_HOST:$rpath/" >>"$LOG_FILE" 2>&1; then
                 log "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
                 report "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
@@ -481,6 +494,92 @@ remote_pull() {
             return $rc ;;
         *)  echo "Unknown REMOTE_METHOD: $REMOTE_METHOD"; return 1 ;;
     esac
+}
+
+# ----------------------------------------------------------------- folders --
+# ARCHIVE mode: small folders (e.g. /etc) tar-gzipped daily into the same
+# dated dir as the DB dumps - inherits retention, mirror, encryption, verify.
+archive_folders() {
+    local dest="$1" d name out aext rc
+    [ -n "$ARCHIVE_DIRS" ] || return 0
+    aext="tar.gz"
+    [ "$ENCRYPT_ENABLED" = "yes" ] && aext="tar.gz.gpg"
+    for d in $ARCHIVE_DIRS; do
+        if [ ! -d "$d" ]; then
+            warn "Archive folder '$d' does not exist - skipped."
+            continue
+        fi
+        name="$(echo "${d#/}" | tr '/' '-')"
+        out="$dest/_files-${name}.${aext}"
+        tar -C / -czf "$out.tmp" "${d#/}" 2>>"$LOG_FILE"
+        rc=$?
+        # tar exit 1 = "file changed while reading" - acceptable for live dirs
+        if [ "$rc" -le 1 ] && finalize_dump "$out.tmp" "$out"; then
+            log "Folder archive OK: $d -> $(basename "$out")"
+            report "  OK   $d -> $(basename "$out") ($(du -h "$out" | cut -f1))"
+        else
+            rm -f "$out.tmp"
+            fail "Folder archive FAILED for '$d'."
+        fi
+    done
+}
+
+# MIRROR mode: big folders rsynced DIRECTLY to the remote (never stored
+# locally). Point-in-time history comes from Storage Box snapshots.
+folders_mirror() {
+    [ "$FOLDERS_ENABLED" = "yes" ] || return 0
+    if [ "$REMOTE_ENABLED" != "yes" ] || [ "$REMOTE_METHOD" != "rsync" ]; then
+        warn "Folder mirror requires remote rsync - skipped."
+        return 1
+    fi
+    if [ ! -f "$FOLDERS_FILE" ]; then
+        warn "Folder mirror enabled but $FOLDERS_FILE is missing."
+        return 1
+    fi
+    local ssh_opts rbase dirs=() dir name size_mb ex_opt=() scaffold
+    ssh_opts="-p $REMOTE_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    [ -n "$SSH_KEY" ] && ssh_opts="$ssh_opts -i $SSH_KEY"
+    rbase="$(remote_full_path)"
+
+    while IFS= read -r dir; do
+        case "$dir" in ""|\#*) continue ;; esac
+        dirs+=("$dir")
+    done < "$FOLDERS_FILE"
+    if [ "${#dirs[@]}" -eq 0 ]; then
+        warn "Folder mirror enabled but $FOLDERS_FILE lists no folders."
+        return 1
+    fi
+    [ -f "$FOLDER_EXCLUDES_FILE" ] && ex_opt=(--exclude-from="$FOLDER_EXCLUDES_FILE")
+
+    # pre-create the remote dir tree via an empty local scaffold (works on
+    # restricted shells like Hetzner Storage Box)
+    scaffold="$(mktemp -d /tmp/slbck.XXXXXX)"
+    for dir in "${dirs[@]}"; do
+        mkdir -p "$scaffold/folders/$(echo "${dir#/}" | tr '/' '-')"
+    done
+    rsync -a -e "ssh $ssh_opts" "$scaffold/" \
+        "$REMOTE_USER@$REMOTE_HOST:$rbase/" >>"$LOG_FILE" 2>&1
+    rm -rf "$scaffold"
+
+    report "Folder mirror -> $REMOTE_HOST:$rbase/folders (no local copy)"
+    for dir in "${dirs[@]}"; do
+        if [ ! -d "$dir" ]; then
+            warn "Mirror folder '$dir' does not exist - skipped."
+            continue
+        fi
+        name="$(echo "${dir#/}" | tr '/' '-')"
+        size_mb="$(du -sm "$dir" 2>/dev/null | cut -f1)"
+        if [ "${size_mb:-0}" -gt $((FOLDERS_MAX_GB * 1024)) ]; then
+            warn "Folder '$dir' is ${size_mb} MB (limit FOLDERS_MAX_GB=${FOLDERS_MAX_GB} GB) - check what grew."
+        fi
+        if rsync -az --delete "${ex_opt[@]}" -e "ssh $ssh_opts" \
+            "$dir/" "$REMOTE_USER@$REMOTE_HOST:$rbase/folders/$name/" >>"$LOG_FILE" 2>&1; then
+            log "Folder mirror OK: $dir (${size_mb} MB)"
+            report "  OK   $dir (${size_mb} MB) -> folders/$name/"
+        else
+            fail "Folder mirror FAILED for '$dir' (see $LOG_FILE)."
+        fi
+    done
 }
 
 # ----------------------------------------------------------------- restore --
@@ -619,7 +718,7 @@ verify_run() {
     report "Restore test (backup day: $day)"
     gpg_check || return 1
 
-    for f in "$dir"/*.sql.gz*; do
+    for f in "$dir"/*.sql.gz* "$dir"/*.tar.gz*; do
         [ -f "$f" ] || continue
         files+=("$f")
         if ! integrity_test "$f"; then
@@ -636,7 +735,7 @@ verify_run() {
     # pick the smallest real dump for the restore test (fast); skip _globals
     local pick="" pick_b=0 b
     for f in "${files[@]}"; do
-        case "$(basename "$f")" in _globals.*) continue ;; esac
+        case "$(basename "$f")" in _globals.*|_files-*) continue ;; esac
         b="$(stat -c %s "$f" 2>/dev/null || echo 0)"
         if [ "$b" -ge 5120 ] && { [ -z "$pick" ] || [ "$b" -lt "$pick_b" ]; }; then
             pick="$f"; pick_b="$b"
@@ -644,7 +743,7 @@ verify_run() {
     done
     if [ -z "$pick" ]; then
         for f in "${files[@]}"; do
-            case "$(basename "$f")" in _globals.*) continue ;; esac
+            case "$(basename "$f")" in _globals.*|_files-*) continue ;; esac
             b="$(stat -c %s "$f" 2>/dev/null || echo 0)"
             if [ "$b" -gt "$pick_b" ]; then pick="$f"; pick_b="$b"; fi
         done
@@ -817,6 +916,12 @@ cmd_backup() {
             done ;;
     esac
 
+    if [ -n "$ARCHIVE_DIRS" ]; then
+        report ""
+        report "Folder archives (daily, stored with DB dumps):"
+        archive_folders "$dest"
+    fi
+
     report ""
     report "Databases dumped: $count"
     report "Local folder: $dest ($(du -sh "$dest" 2>/dev/null | cut -f1))"
@@ -830,6 +935,10 @@ cmd_backup() {
 
     apply_retention
     remote_send
+    if [ "$FOLDERS_ENABLED" = "yes" ]; then
+        report ""
+        folders_mirror
+    fi
 
     # Make it explicit in the mail WHERE the backups ended up
     report ""
@@ -869,6 +978,36 @@ finish_backup() {
 }
 
 # ------------------------------------------------------------------- setup --
+write_folder_templates() {
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$FOLDERS_FILE" ]; then
+        cat > "$FOLDERS_FILE" <<'EOF'
+# SLBCK - folders to MIRROR directly to the remote server (rsync, no local
+# copy). One ABSOLUTE path per line. Lines starting with # are ignored.
+# After editing, test with: slbck backup
+#
+# Examples:
+#/var/www
+#/home/data/dokumenti
+EOF
+        chmod 600 "$FOLDERS_FILE"
+        echo "Created $FOLDERS_FILE"
+    fi
+    if [ ! -f "$FOLDER_EXCLUDES_FILE" ]; then
+        cat > "$FOLDER_EXCLUDES_FILE" <<'EOF'
+# SLBCK - rsync exclude patterns for folder mirror (one per line).
+# Applied to every mirrored folder.
+node_modules/
+.cache/
+cache/
+*.tmp
+*.swp
+EOF
+        chmod 600 "$FOLDER_EXCLUDES_FILE"
+        echo "Created $FOLDER_EXCLUDES_FILE"
+    fi
+}
+
 write_config() {
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG" <<EOF
@@ -889,6 +1028,12 @@ ENCRYPT_PASSPHRASE='$ENCRYPT_PASSPHRASE'
 # Weekly restore test (1=Mon..7=Sun)
 VERIFY_ENABLED="$VERIFY_ENABLED"
 VERIFY_DAY="$VERIFY_DAY"
+
+# Folder backup: archive = daily tar.gz with the DB dumps;
+# mirror = folders from $FOLDERS_FILE rsynced directly to remote
+ARCHIVE_DIRS="$ARCHIVE_DIRS"
+FOLDERS_ENABLED="$FOLDERS_ENABLED"
+FOLDERS_MAX_GB="$FOLDERS_MAX_GB"
 
 MAIL_ENABLED="$MAIL_ENABLED"
 MAIL_TO="$MAIL_TO"
@@ -1035,6 +1180,27 @@ cmd_setup() {
     fi
 
     echo
+    echo "Folder backup:"
+    echo " - ARCHIVE: small folders (e.g. /etc) get a daily tar.gz stored with"
+    echo "   the DB dumps - same retention, mirror, encryption and verify."
+    ask "Folders to archive daily (space separated, none = off)" "${ARCHIVE_DIRS:-/etc}"
+    ARCHIVE_DIRS="$REPLY"
+    [ "$ARCHIVE_DIRS" = "none" ] && ARCHIVE_DIRS=""
+
+    if [ "$REMOTE_ENABLED" = "yes" ] && [ "$REMOTE_METHOD" = "rsync" ]; then
+        echo " - MIRROR: big folders (e.g. /var/www) are rsynced DIRECTLY to the"
+        echo "   remote server, never stored locally. History = remote snapshots."
+        ask "Mirror folders to remote? (yes/no)" "$FOLDERS_ENABLED"
+        FOLDERS_ENABLED="$REPLY"
+        if [ "$FOLDERS_ENABLED" = "yes" ]; then
+            write_folder_templates
+            ask "Warn in mail when a folder exceeds N GB" "$FOLDERS_MAX_GB"
+            FOLDERS_MAX_GB="$REPLY"
+            echo "==> Now list your folders in: $FOLDERS_FILE (one path per line)"
+        fi
+    fi
+
+    echo
     write_config
     write_cron
     mkdir -p "$BACKUP_DIR"
@@ -1056,6 +1222,8 @@ cmd_status() {
         echo "Mail:       $MAIL_ENABLED ($MAIL_TO, on=$MAIL_ON)"
         echo "Encryption: $ENCRYPT_ENABLED"
         echo "Verify:     $VERIFY_ENABLED (restore test day: $VERIFY_DAY, 1=Mon..7=Sun)"
+        echo "Archives:   ${ARCHIVE_DIRS:-none}"
+        echo "Mirror:     $FOLDERS_ENABLED ($FOLDERS_FILE, warn > ${FOLDERS_MAX_GB} GB)"
         echo "Remote:     $REMOTE_ENABLED ($REMOTE_METHOD $REMOTE_USER@$REMOTE_HOST:$(remote_full_path))"
     else
         echo "Not configured yet - run: slbck setup"
@@ -1124,8 +1292,29 @@ cmd_guide() {
    Bira se dan pa baza; prije prepisivanja moras utipkati ime baze.
    Ako je remote konfiguriran, nudi povlacenje backupa s remote servera.
 
-6) GDJE JE STO
-   Backup:  /var/backups/slbck/YYYY-MM-DD/baza.sql.gz
+6) BACKUP FOLDERA (uz baze)
+   Dva nacina, biras u setupu:
+
+   a) ARCHIVE - mali folderi (npr. /etc, configi):
+      U setupu upisi popis, npr: /etc /root
+      Svaki dan nastaje _files-etc.tar.gz u dnevnom folderu uz baze -
+      ista retencija, isti mirror na remote, ista enkripcija i verify.
+      Restore:  tar xzf _files-etc.tar.gz -C /tmp/restore-etc
+
+   b) MIRROR - veliki folderi (npr. /var/www, dokumenti):
+      NIKAD se ne spremaju lokalno - rsync ide direktno na remote u
+      <path>/<server>/folders/var-www/. Povijest = snapshotovi
+      Storage Boxa (ukljuci ih u Robot panelu!).
+      Popis foldera:   /etc/slbck/folders.conf  (jedan path po retku)
+      Excludovi:       /etc/slbck/folder-excludes.conf (rsync patterni)
+      Nakon uredivanja testiraj:  slbck backup
+      Mail javlja velicinu svakog foldera i WARNING preko FOLDERS_MAX_GB.
+      Restore foldera (rucno, natrag s remotea):
+        rsync -az -e "ssh -p23" user@host:<path>/<server>/folders/var-www/ /var/www/
+
+7) GDJE JE STO
+   Backup:  /var/backups/slbck/YYYY-MM-DD/baza.sql.gz (+ _files-*.tar.gz)
+   Folderi: /etc/slbck/folders.conf + folder-excludes.conf (mirror popis)
    Config:  /etc/slbck/slbck.conf   (chmod 600)
    Cron:    /etc/cron.d/slbck
    Log:     /var/log/slbck.log
