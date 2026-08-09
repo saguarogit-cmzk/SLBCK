@@ -186,6 +186,12 @@ Excludovi (vrijede za sve foldere): `/etc/slbck/folder-excludes.conf` —
 rsync patterni, po defaultu već isključuje `node_modules/`, `cache/`,
 `*.tmp`. Nakon uređivanja testiraj s `sudo slbck backup`.
 
+**Sigurnost synca**: izvorni folderi na serveru se samo **čitaju** — SLBCK u
+njih nikad ne piše. Na remoteu se po defaultu **ništa ne briše**
+(`FOLDERS_DELETE="no"`): fajlovi se samo dodaju i ažuriraju, pa i lokalno
+obrisani fajl ostaje na boxu. Pravi mirror s brisanjem je svjesni opt-in
+(`FOLDERS_DELETE="yes"`), a povijest verzija u oba slučaja čuvaju snapshotovi.
+
 Kontrola veličine: mail javlja veličinu svakog foldera, a preko
 `FOLDERS_MAX_GB` (default 50) dobiješ WARNING — odmah vidiš kad nešto
 naraste. Mirror = na remoteu je uvijek 1× stvarna veličina foldera, prijenos

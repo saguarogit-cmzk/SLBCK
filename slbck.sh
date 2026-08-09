@@ -60,6 +60,9 @@ VERIFY_DAY="7"              # 1=Mon .. 7=Sun (day when restore test runs)
 ARCHIVE_DIRS=""             # space separated, e.g. "/etc /root"
 FOLDERS_ENABLED="no"        # yes = mirror folders from folders.conf to remote
 FOLDERS_MAX_GB="50"         # warn in mail when a mirrored folder exceeds this
+FOLDERS_DELETE="no"         # no  = SAFE sync: only add/update on remote, never delete
+                            # yes = true mirror: files deleted locally are
+                            #       deleted on remote too (snapshots keep history)
 FOLDERS_FILE="$CONFIG_DIR/folders.conf"
 FOLDER_EXCLUDES_FILE="$CONFIG_DIR/folder-excludes.conf"
 
@@ -561,7 +564,11 @@ folders_mirror() {
         "$REMOTE_USER@$REMOTE_HOST:$rbase/" >>"$LOG_FILE" 2>&1
     rm -rf "$scaffold"
 
-    report "Folder mirror -> $REMOTE_HOST:$rbase/folders (no local copy)"
+    # Source folders are only ever READ. Remote deletion happens only with
+    # the explicit FOLDERS_DELETE=yes opt-in; default is add/update only.
+    local del_opt=()
+    [ "$FOLDERS_DELETE" = "yes" ] && del_opt=(--delete)
+    report "Folder mirror -> $REMOTE_HOST:$rbase/folders (no local copy, delete=${FOLDERS_DELETE})"
     for dir in "${dirs[@]}"; do
         if [ ! -d "$dir" ]; then
             warn "Mirror folder '$dir' does not exist - skipped."
@@ -572,7 +579,7 @@ folders_mirror() {
         if [ "${size_mb:-0}" -gt $((FOLDERS_MAX_GB * 1024)) ]; then
             warn "Folder '$dir' is ${size_mb} MB (limit FOLDERS_MAX_GB=${FOLDERS_MAX_GB} GB) - check what grew."
         fi
-        if rsync -az --delete "${ex_opt[@]}" -e "ssh $ssh_opts" \
+        if rsync -az "${del_opt[@]}" "${ex_opt[@]}" -e "ssh $ssh_opts" \
             "$dir/" "$REMOTE_USER@$REMOTE_HOST:$rbase/folders/$name/" >>"$LOG_FILE" 2>&1; then
             log "Folder mirror OK: $dir (${size_mb} MB)"
             report "  OK   $dir (${size_mb} MB) -> folders/$name/"
@@ -1034,6 +1041,8 @@ VERIFY_DAY="$VERIFY_DAY"
 ARCHIVE_DIRS="$ARCHIVE_DIRS"
 FOLDERS_ENABLED="$FOLDERS_ENABLED"
 FOLDERS_MAX_GB="$FOLDERS_MAX_GB"
+# no = safe sync (only add/update on remote), yes = true mirror with deletes
+FOLDERS_DELETE="$FOLDERS_DELETE"
 
 MAIL_ENABLED="$MAIL_ENABLED"
 MAIL_TO="$MAIL_TO"
@@ -1307,6 +1316,8 @@ cmd_guide() {
       Storage Boxa (ukljuci ih u Robot panelu!).
       Popis foldera:   /etc/slbck/folders.conf  (jedan path po retku)
       Excludovi:       /etc/slbck/folder-excludes.conf (rsync patterni)
+      SIGURNO: izvorni folderi se samo CITAJU; na remoteu se default
+      nista ne brise (FOLDERS_DELETE=no) - samo dodaje i azurira.
       Nakon uredivanja testiraj:  slbck backup
       Mail javlja velicinu svakog foldera i WARNING preko FOLDERS_MAX_GB.
       Restore foldera (rucno, natrag s remotea):

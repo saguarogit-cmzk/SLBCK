@@ -43,6 +43,11 @@ ARCHIVE_DIRS="/etc"
 FOLDERS_ENABLED="no"
 # Warn in the mail when a mirrored folder exceeds this size
 FOLDERS_MAX_GB="50"
+# no  = SAFE sync (default): remote only gets adds/updates, never deletions -
+#       a file deleted locally stays on the remote.
+# yes = true mirror: local deletions propagate to the remote (Storage Box
+#       snapshots still keep history).
+FOLDERS_DELETE="no"
 
 # --- E-mail notifications ---------------------------------------------------
 # If the server has no mail transport, 'slbck setup' offers to install and
