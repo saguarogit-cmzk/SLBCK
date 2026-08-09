@@ -15,10 +15,28 @@ RETENTION_DAYS="3"
 # Hour of the daily cron run (1-6 = 01:00-06:00 server local time)
 CRON_HOUR="3"
 
+# Abort backup if free disk space is below this (or below 2x last backup size)
+MIN_FREE_MB="500"
+
+# --- GPG encryption ---------------------------------------------------------
+# yes = dumps are AES256-encrypted at rest (.sql.gz.gpg), locally and remote.
+# Passphrase: min 12 characters. WITHOUT IT THERE IS NO RESTORE - store it in
+# your password manager too, not only on this server!
+ENCRYPT_ENABLED="no"
+ENCRYPT_PASSPHRASE=''
+
+# --- Weekly restore test ----------------------------------------------------
+# SLBCK restores one database into a temporary DB (slbck_verify), counts the
+# tables and drops it - proof that backups are actually restorable. Result is
+# part of the backup mail; run manually anytime with 'slbck verify'.
+VERIFY_ENABLED="yes"
+VERIFY_DAY="7"          # 1=Mon .. 7=Sun
+
 # --- E-mail notifications ---------------------------------------------------
 # If the server has no mail transport, 'slbck setup' offers to install and
 # configure msmtp (lightweight SMTP relay) automatically.
 MAIL_ENABLED="no"
+# One or more recipients, comma separated: "a@x.com, b@y.com"
 MAIL_TO=""
 # Empty = slbck@<hostname>
 MAIL_FROM=""
@@ -26,6 +44,12 @@ MAIL_FROM=""
 MAIL_ON="always"
 
 # --- Off-server copy -------------------------------------------------------
+# Hetzner Storage Box example (enable "SSH support" in Robot panel first):
+#   REMOTE_METHOD="rsync"  REMOTE_HOST="uXXXXX.your-storagebox.de"
+#   REMOTE_PORT="23"       REMOTE_USER="uXXXXX" (or a sub-account per server)
+#   REMOTE_PATH="/home/backup"  REMOTE_SUBDIR="auto"
+# Also enable Storage Box snapshots - a compromised server then cannot
+# destroy its own remote backups.
 REMOTE_ENABLED="no"
 # rsync = mirrors the whole local backup dir (remote keeps same retention)
 # sftp  = uploads today's folder only
@@ -34,6 +58,9 @@ REMOTE_HOST=""
 REMOTE_PORT="22"
 REMOTE_USER=""
 REMOTE_PATH=""
+# Subfolder on the remote so multiple servers can share one target:
+# auto = short hostname of this server, empty = none, or a custom name.
+REMOTE_SUBDIR="auto"
 # Optional SSH private key; empty = root's default key. Key auth must already
 # work non-interactively (ssh-copy-id) - SLBCK never stores SSH passwords.
 SSH_KEY=""

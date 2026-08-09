@@ -1,0 +1,10 @@
+/var/log/slbck.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    maxsize 20M
+    create 0640 root root
+}

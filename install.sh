@@ -25,6 +25,14 @@ else
     echo "Existing config kept: $CONFIG_DIR/slbck.conf"
 fi
 
+if [ -d /etc/logrotate.d ]; then
+    install -m 644 "$SRC_DIR/logrotate/slbck" /etc/logrotate.d/slbck
+    echo "Logrotate installed: /etc/logrotate.d/slbck"
+fi
+
+# remember where the git clone lives, for 'slbck update'
+echo "$SRC_DIR" > "$CONFIG_DIR/source_dir"
+
 mkdir -p /var/backups/slbck
 chmod 700 /var/backups/slbck
 touch /var/log/slbck.log

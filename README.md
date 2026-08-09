@@ -12,9 +12,13 @@ Ubuntuu, RHEL/Alma/Rocky i sličnima.
 3. Drži zadnja **3 dana** lokalno (podesivo), starije automatski briše
 4. Opcionalno šalje backup na vanjski server (**rsync** ili **sftp** preko SSH ključa)
 5. **Restore** bilo koje baze iz lokalnih backupa ili povlačenjem s remote servera
-6. Šalje **mail obavijest** o uspjehu ili grešci — ako server nema mail sustav,
+6. **Tjedni restore test s potvrdom** — stvarno restora jednu bazu u privremenu
+   DB, prebroji tablice, obriše je i rezultat pošalje mailom
+7. Opcionalna **GPG AES256 enkripcija** dumpova (lokalno i na remoteu)
+8. Šalje **mail obavijest** o uspjehu ili grešci — ako server nema mail sustav,
    setup ga sam instalira i podesi (msmtp SMTP relay)
-7. Vrti se kao **cron job** u fiksno vrijeme (izbor 01:00–06:00)
+9. Vrti se kao **cron job** u fiksno vrijeme (izbor 01:00–06:00), log se
+   rotira kroz logrotate, disk se provjerava prije svakog backupa
 
 ## Instalacija
 
@@ -58,6 +62,8 @@ Sve opcije rade i direktno iz CLI-ja (za skriptiranje):
 | `slbck setup` | Samo setup čarobnjak (config + cron) |
 | `slbck backup` | Backup odmah (check → dump → retencija → remote → mail) |
 | `slbck restore` | Interaktivni restore jedne baze (izbor dana → izbor baze) |
+| `slbck verify` | Restore test odmah: integritet svih dumpova + stvarni restore jedne baze u temp DB, s potvrdom mailom |
+| `slbck update` | Povuci novu verziju SLBCK-a s gita i reinstaliraj |
 | `slbck send` | (Ponovno) pošalji lokalne backupe na remote server |
 | `slbck pull` | Povuci backupe s remote servera u lokalni folder |
 | `slbck check` | Samo provjera database servisa |
@@ -113,16 +119,56 @@ zcat baza.sql.gz | sudo -u postgres psql -d postgres   # PostgreSQL
   `[local+remote]` s adresom vanjske lokacije kad je remote uključen.
 - Test: `slbck test-mail`.
 
+## Restore test (verify)
+
+Backup koji nikad nisi restorao nije backup. SLBCK zato jednom tjedno (dan
+podesiv u setupu, default nedjelja) automatski:
+
+1. provjeri integritet **svih** dumpova zadnjeg backupa (gzip/gpg test),
+2. **stvarno restora** jednu bazu u privremenu DB `slbck_verify`,
+3. prebroji tablice, obriše privremenu bazu,
+4. rezultat upiše u backup mail — potvrda da je backup zaista upotrebljiv.
+
+Ručno bilo kada: `slbck verify` (uvijek šalje mail potvrdu, OK ili ERROR).
+
+## GPG enkripcija (opcionalno)
+
+- U setupu odgovoriš `yes` i uneseš passphrase (**min 12 znakova**, dvaput).
+- Dumpovi postaju `baza.sql.gz.gpg` (AES256) — enkriptirani i lokalno i na
+  remote serveru. Restore i verify rade transparentno.
+- **VAŽNO**: passphrase spremi i u password manager. Bez nje restore ne
+  postoji — pogotovo u disaster scenariju kad server (i config) više nema.
+- Ručni restore enkriptiranog dumpa:
+  `gpg -d baza.sql.gz.gpg | gunzip | mysql`
+
 ## Remote kopija
 
 - **rsync**: mirrora cijeli lokalni backup folder → remote ima istu retenciju
   kao lokalno, bez ručnog čišćenja.
 - **sftp**: uploada samo današnji folder.
+- `REMOTE_SUBDIR="auto"` (default): svaki server piše u svoj podfolder
+  (hostname) — više servera može dijeliti isti target.
 - SSH key auth mora raditi bez lozinke (`ssh-copy-id user@backupserver`).
   SLBCK ne sprema SSH lozinke.
 
-## Sigurnost
+### Hetzner Storage Box
 
-- Config `/etc/slbck/slbck.conf` je `chmod 600` (može sadržavati MySQL lozinku)
+U Robot panelu uključi **SSH support**, pa u setupu:
+`rsync`, host `uXXXXX.your-storagebox.de`, **port 23**, user `uXXXXX`
+(najbolje sub-account po serveru), path npr. `/home/backup`, subdir `auto`.
+Ključ: `ssh-copy-id -p 23 uXXXXX@uXXXXX.your-storagebox.de`.
+Preporuka: uključi i **automatske snapshotove** Storage Boxa — server tada ne
+može uništiti vlastite remote backupe (zaštita od ransomwarea i grešaka).
+
+## Sigurnost i higijena
+
+- Config `/etc/slbck/slbck.conf` je `chmod 600` (može sadržavati MySQL lozinku
+  i GPG passphrase)
 - Backup folder je `chmod 700`
 - Restore traži utipkavanje imena baze kao potvrdu prije prepisivanja
+- Prije backupa se provjerava slobodan disk (min 2× zadnji backup ili
+  `MIN_FREE_MB`) — backup se ne pokreće na pun disk
+- Dump manji od 50% jučerašnjeg ili gotovo prazan → WARNING u mailu
+- Log `/var/log/slbck.log` se rotira kroz `/etc/logrotate.d/slbck`
+  (weekly, 8 rotacija, max 20 MB)
+- Održavanje flote: `slbck update` povuče novu verziju s gita i reinstalira

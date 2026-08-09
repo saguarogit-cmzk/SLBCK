@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.2.0"
+VERSION="1.3.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -39,9 +39,15 @@ REMOTE_HOST=""
 REMOTE_PORT="22"
 REMOTE_USER=""
 REMOTE_PATH=""
+REMOTE_SUBDIR="auto"        # auto = short hostname, empty = none, or custom name
 SSH_KEY=""                  # optional private key path
 MYSQL_USER=""               # empty = socket auth (root)
 MYSQL_PASS=""
+MIN_FREE_MB="500"           # abort backup if less than this (or 2x last backup) free
+ENCRYPT_ENABLED="no"        # yes = gpg AES256 symmetric encryption of dumps
+ENCRYPT_PASSPHRASE=""       # min 12 chars; ALSO STORE IT IN YOUR PASSWORD MANAGER
+VERIFY_ENABLED="yes"        # weekly automatic restore test
+VERIFY_DAY="7"              # 1=Mon .. 7=Sun (day when restore test runs)
 
 [ -f "$CONFIG" ] && . "$CONFIG"
 
@@ -49,6 +55,7 @@ HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
 TODAY="$(date +%F)"
 REPORT=""
 ERRORS=0
+WARNINGS=0
 
 # ---------------------------------------------------------------- helpers ---
 log() {
@@ -60,6 +67,8 @@ log() {
 report() { REPORT="${REPORT}$*"$'\n'; }
 
 fail() { ERRORS=$((ERRORS+1)); log "ERROR: $*"; report "ERROR: $*"; }
+
+warn() { WARNINGS=$((WARNINGS+1)); log "WARNING: $*"; report "WARNING: $*"; }
 
 need_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -89,9 +98,11 @@ send_mail() {
         printf 'From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s\n' \
             "$from" "$MAIL_TO" "$subject" "$body" | $mta -t
     elif command -v mailx >/dev/null 2>&1; then
-        printf '%s\n' "$body" | mailx -s "$subject" "$MAIL_TO"
+        # shellcheck disable=SC2086
+        printf '%s\n' "$body" | mailx -s "$subject" ${MAIL_TO//,/ }
     elif command -v mail >/dev/null 2>&1; then
-        printf '%s\n' "$body" | mail -s "$subject" "$MAIL_TO"
+        # shellcheck disable=SC2086
+        printf '%s\n' "$body" | mail -s "$subject" ${MAIL_TO//,/ }
     else
         log "No mail transport found - run 'slbck setup' to install one (msmtp)."
         return 1
@@ -218,6 +229,68 @@ service_check() {
     esac
 }
 
+# ------------------------------------------------------- encryption layer ---
+# Dumps are always plain gzipped SQL first; with ENCRYPT_ENABLED=yes the
+# verified gzip is additionally wrapped in gpg AES256 (file ext .sql.gz.gpg).
+dump_ext() {
+    if [ "$ENCRYPT_ENABLED" = "yes" ]; then echo "sql.gz.gpg"; else echo "sql.gz"; fi
+}
+
+gpg_check() {
+    [ "$ENCRYPT_ENABLED" = "yes" ] || return 0
+    if ! command -v gpg >/dev/null 2>&1; then
+        fail "Encryption is enabled but gpg is not installed (apt-get install gnupg)."
+        return 1
+    fi
+    if [ "${#ENCRYPT_PASSPHRASE}" -lt 12 ]; then
+        fail "ENCRYPT_PASSPHRASE is shorter than 12 characters."
+        return 1
+    fi
+}
+
+# finalize_dump <tmp-gzip-file> <final-file>: gzip integrity test, then
+# encrypt or rename. Never leaves a half-written file under the final name.
+finalize_dump() {
+    local tmp="$1" out="$2"
+    gzip -t "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    if [ "$ENCRYPT_ENABLED" = "yes" ]; then
+        if gpg --batch --yes --quiet --symmetric --cipher-algo AES256 \
+               --pinentry-mode loopback \
+               --passphrase-file <(printf '%s' "$ENCRYPT_PASSPHRASE") \
+               -o "$out" "$tmp" 2>>"$LOG_FILE"; then
+            rm -f "$tmp"
+        else
+            rm -f "$tmp" "$out"
+            return 1
+        fi
+    else
+        mv "$tmp" "$out"
+    fi
+}
+
+# decrypt_stream <file>: plain SQL on stdout, whatever the file format is
+decrypt_stream() {
+    case "$1" in
+        *.gpg)
+            gpg --batch --quiet --decrypt --pinentry-mode loopback \
+                --passphrase-file <(printf '%s' "$ENCRYPT_PASSPHRASE") \
+                "$1" 2>>"$LOG_FILE" | gunzip -c ;;
+        *)  gunzip -c "$1" ;;
+    esac
+}
+
+# integrity_test <file>: verify archive (and decryption) without restoring
+integrity_test() {
+    case "$1" in
+        *.gpg)
+            ( set -o pipefail
+              gpg --batch --quiet --decrypt --pinentry-mode loopback \
+                  --passphrase-file <(printf '%s' "$ENCRYPT_PASSPHRASE") \
+                  "$1" 2>/dev/null | gzip -t 2>/dev/null ) ;;
+        *)  gzip -t "$1" 2>/dev/null ;;
+    esac
+}
+
 # ------------------------------------------------------------ mysql layer ---
 MYSQL_CNF=""
 mysql_auth_setup() {
@@ -243,8 +316,7 @@ mysql_dump_db() {
         --databases "$db" 2>>"$LOG_FILE" | gzip > "$out.tmp"
     local rc=("${PIPESTATUS[@]}")
     if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then rm -f "$out.tmp"; return 1; fi
-    gzip -t "$out.tmp" 2>/dev/null || { rm -f "$out.tmp"; return 1; }
-    mv "$out.tmp" "$out"
+    finalize_dump "$out.tmp" "$out"
 }
 
 # ------------------------------------------------------- postgresql layer ---
@@ -257,8 +329,7 @@ pg_dump_db() {
     run_as_postgres pg_dump --create --clean --if-exists "$db" 2>>"$LOG_FILE" | gzip > "$out.tmp"
     local rc=("${PIPESTATUS[@]}")
     if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then rm -f "$out.tmp"; return 1; fi
-    gzip -t "$out.tmp" 2>/dev/null || { rm -f "$out.tmp"; return 1; }
-    mv "$out.tmp" "$out"
+    finalize_dump "$out.tmp" "$out"
 }
 
 pg_dump_globals() {
@@ -266,7 +337,44 @@ pg_dump_globals() {
     run_as_postgres pg_dumpall --globals-only 2>>"$LOG_FILE" | gzip > "$out.tmp"
     local rc=("${PIPESTATUS[@]}")
     if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then rm -f "$out.tmp"; return 1; fi
-    mv "$out.tmp" "$out"
+    finalize_dump "$out.tmp" "$out"
+}
+
+# ------------------------------------------------------------ safety checks -
+# Abort early if the disk can't hold another backup: require at least
+# 2x the size of the last backup day, and never less than MIN_FREE_MB.
+check_disk_space() {
+    local free_mb last_dir last_mb=0 req_mb
+    free_mb="$(df -Pm "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    [ -n "$free_mb" ] || { warn "Could not determine free disk space."; return 0; }
+    last_dir="$(ls -1d "$BACKUP_DIR"/????-??-?? 2>/dev/null | tail -1)"
+    [ -n "$last_dir" ] && last_mb="$(du -sm "$last_dir" 2>/dev/null | cut -f1)"
+    req_mb=$(( last_mb * 2 ))
+    [ "$req_mb" -lt "$MIN_FREE_MB" ] && req_mb="$MIN_FREE_MB"
+    if [ "$free_mb" -lt "$req_mb" ]; then
+        fail "Not enough disk space: ${free_mb} MB free, ${req_mb} MB required. Backup aborted."
+        return 1
+    fi
+    report "Disk space OK: ${free_mb} MB free (required: ${req_mb} MB)"
+}
+
+# Warn if a dump is suspiciously small: near-empty, or <50% of the same
+# database's dump from the previous backup day (catches silent failures).
+PREV_DIR=""
+sanity_check_size() {
+    local db="$1" f="$2" new_b prev_f prev_b
+    new_b="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    if [ "$new_b" -lt 200 ]; then
+        warn "Dump of '$db' is suspiciously small (${new_b} bytes)."
+        return 0
+    fi
+    [ -n "$PREV_DIR" ] || return 0
+    prev_f="$(ls -1 "$PREV_DIR/$db".sql.gz* 2>/dev/null | head -1)"
+    [ -n "$prev_f" ] || return 0
+    prev_b="$(stat -c %s "$prev_f" 2>/dev/null || echo 0)"
+    if [ "$prev_b" -gt 0 ] && [ "$new_b" -lt $((prev_b / 2)) ]; then
+        warn "Dump of '$db' is less than 50% of the previous one (${new_b} vs ${prev_b} bytes) - please verify."
+    fi
 }
 
 # --------------------------------------------------------------- retention --
@@ -285,6 +393,16 @@ apply_retention() {
 }
 
 # ------------------------------------------------------------------ remote --
+# Effective remote path: REMOTE_SUBDIR keeps each server in its own folder
+# when multiple servers share one target (e.g. one Hetzner Storage Box).
+remote_full_path() {
+    case "$REMOTE_SUBDIR" in
+        auto) echo "$REMOTE_PATH/$(hostname -s)" ;;
+        "")   echo "$REMOTE_PATH" ;;
+        *)    echo "$REMOTE_PATH/$REMOTE_SUBDIR" ;;
+    esac
+}
+
 remote_send() {
     [ "$REMOTE_ENABLED" = "yes" ] || return 0
     if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_USER" ] || [ -z "$REMOTE_PATH" ]; then
@@ -293,15 +411,17 @@ remote_send() {
     fi
     local ssh_opts="-p $REMOTE_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
     [ -n "$SSH_KEY" ] && ssh_opts="$ssh_opts -i $SSH_KEY"
+    local rpath
+    rpath="$(remote_full_path)"
 
     case "$REMOTE_METHOD" in
         rsync)
             if ! command -v rsync >/dev/null 2>&1; then fail "rsync is not installed."; return 1; fi
             # Mirror local backup dir (local retention == remote retention)
             if rsync -az --delete -e "ssh $ssh_opts" \
-                "$BACKUP_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/" >>"$LOG_FILE" 2>&1; then
-                log "Remote sync OK (rsync -> $REMOTE_HOST:$REMOTE_PATH)"
-                report "Remote sync OK (rsync -> $REMOTE_HOST:$REMOTE_PATH)"
+                "$BACKUP_DIR/" "$REMOTE_USER@$REMOTE_HOST:$rpath/" >>"$LOG_FILE" 2>&1; then
+                log "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
+                report "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
             else
                 fail "rsync to $REMOTE_HOST failed (see $LOG_FILE)."
                 return 1
@@ -311,15 +431,16 @@ remote_send() {
             batch="$(mktemp /tmp/slbck.XXXXXX.sftp)"
             {
                 echo "-mkdir $REMOTE_PATH"
-                echo "-mkdir $REMOTE_PATH/$TODAY"
-                for f in "$BACKUP_DIR/$TODAY"/*.gz; do
-                    [ -f "$f" ] && echo "put $f $REMOTE_PATH/$TODAY/"
+                echo "-mkdir $rpath"
+                echo "-mkdir $rpath/$TODAY"
+                for f in "$BACKUP_DIR/$TODAY"/*; do
+                    [ -f "$f" ] && echo "put $f $rpath/$TODAY/"
                 done
             } > "$batch"
             # shellcheck disable=SC2086
             if sftp $ssh_opts -b "$batch" "$REMOTE_USER@$REMOTE_HOST" >>"$LOG_FILE" 2>&1; then
-                log "Remote sync OK (sftp -> $REMOTE_HOST:$REMOTE_PATH/$TODAY)"
-                report "Remote sync OK (sftp -> $REMOTE_HOST:$REMOTE_PATH/$TODAY)"
+                log "Remote sync OK (sftp -> $REMOTE_HOST:$rpath/$TODAY)"
+                report "Remote sync OK (sftp -> $REMOTE_HOST:$rpath/$TODAY)"
                 rm -f "$batch"
             else
                 rm -f "$batch"
@@ -338,16 +459,18 @@ remote_pull() {
     fi
     local ssh_opts="-p $REMOTE_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
     [ -n "$SSH_KEY" ] && ssh_opts="$ssh_opts -i $SSH_KEY"
+    local rpath
+    rpath="$(remote_full_path)"
     mkdir -p "$BACKUP_DIR"
-    echo "Pulling backups from $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH ..."
+    echo "Pulling backups from $REMOTE_USER@$REMOTE_HOST:$rpath ..."
     case "$REMOTE_METHOD" in
         rsync)
             rsync -az -e "ssh $ssh_opts" \
-                "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/" "$BACKUP_DIR/" ;;
+                "$REMOTE_USER@$REMOTE_HOST:$rpath/" "$BACKUP_DIR/" ;;
         sftp)
             local batch
             batch="$(mktemp /tmp/slbck.XXXXXX.sftp)"
-            printf 'get -r %s/* %s/\n' "$REMOTE_PATH" "$BACKUP_DIR" > "$batch"
+            printf 'get -r %s/* %s/\n' "$rpath" "$BACKUP_DIR" > "$batch"
             # shellcheck disable=SC2086
             sftp $ssh_opts -b "$batch" "$REMOTE_USER@$REMOTE_HOST"
             local rc=$?
@@ -398,7 +521,7 @@ cmd_restore() {
     # 2) pick a database file
     local files=()
     local f
-    for f in "$BACKUP_DIR/$day"/*.sql.gz; do
+    for f in "$BACKUP_DIR/$day"/*.sql.gz*; do
         [ -f "$f" ] && files+=("$(basename "$f")")
     done
     if [ "${#files[@]}" -eq 0 ]; then
@@ -409,7 +532,7 @@ cmd_restore() {
     echo "Databases in $day:"
     i=1
     for f in "${files[@]}"; do
-        echo "  $i) ${f%.sql.gz} ($(du -h "$BACKUP_DIR/$day/$f" | cut -f1))"
+        echo "  $i) ${f%%.sql.gz*} ($(du -h "$BACKUP_DIR/$day/$f" | cut -f1))"
         i=$((i+1))
     done
     while :; do
@@ -418,12 +541,18 @@ cmd_restore() {
         echo "Enter a number 1-${#files[@]}."
     done
     local file="${files[$((REPLY-1))]}"
-    local dbname="${file%.sql.gz}"
+    local dbname="${file%%.sql.gz*}"
     local dump="$BACKUP_DIR/$day/$file"
 
-    # 3) verify archive, confirm, restore
-    if ! gzip -t "$dump" 2>/dev/null; then
-        echo "ERROR: $dump is corrupted (gzip test failed)."
+    # 3) verify archive (and decryption), confirm, restore
+    case "$dump" in *.gpg)
+        if [ -z "$ENCRYPT_PASSPHRASE" ]; then
+            echo "ERROR: dump is GPG-encrypted but ENCRYPT_PASSPHRASE is not set in $CONFIG."
+            return 1
+        fi ;;
+    esac
+    if ! integrity_test "$dump"; then
+        echo "ERROR: $dump is corrupted (integrity test failed)."
         return 1
     fi
 
@@ -439,7 +568,7 @@ cmd_restore() {
     case "$engine" in
         mysql)
             mysql_auth_setup
-            if zcat "$dump" | mysql_cmd; then
+            if decrypt_stream "$dump" | mysql_cmd; then
                 log "RESTORE OK: $dbname from $day"
                 echo "Restore finished OK: $dbname"
             else
@@ -456,7 +585,7 @@ cmd_restore() {
                 run_as_postgres psql -d postgres -c \
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$dbname' AND pid <> pg_backend_pid();" >/dev/null 2>&1
             fi
-            zcat "$dump" | run_as_postgres psql -d postgres
+            decrypt_stream "$dump" | run_as_postgres psql -d postgres
             local prc=("${PIPESTATUS[@]}")
             if [ "${prc[0]}" -eq 0 ] && [ "${prc[1]}" -eq 0 ]; then
                 log "RESTORE OK: $dbname from $day"
@@ -470,6 +599,133 @@ cmd_restore() {
     esac
 }
 
+# ------------------------------------------------------------------ verify --
+# Restore test with confirmation: checks archive integrity of every dump in
+# the newest backup day, then REALLY restores one database into a temporary
+# DB (slbck_verify), counts the tables and drops it again. The result goes
+# into the report/mail - proof that backups are actually restorable.
+verify_run() {
+    local engine day dir f files=() bad=0
+    engine="$(detect_engine)"
+    dir="$(ls -1d "$BACKUP_DIR"/????-??-?? 2>/dev/null | tail -1)"
+    if [ -z "$dir" ]; then
+        fail "Verify: no backups found in $BACKUP_DIR."
+        return 1
+    fi
+    day="$(basename "$dir")"
+    report "Restore test (backup day: $day)"
+    gpg_check || return 1
+
+    for f in "$dir"/*.sql.gz*; do
+        [ -f "$f" ] || continue
+        files+=("$f")
+        if ! integrity_test "$f"; then
+            fail "Verify: archive integrity FAILED for $(basename "$f")"
+            bad=$((bad+1))
+        fi
+    done
+    if [ "${#files[@]}" -eq 0 ]; then
+        fail "Verify: no dump files in $dir."
+        return 1
+    fi
+    report "  Archive integrity: $(( ${#files[@]} - bad ))/${#files[@]} OK"
+
+    # pick the smallest real dump for the restore test (fast); skip _globals
+    local pick="" pick_b=0 b
+    for f in "${files[@]}"; do
+        case "$(basename "$f")" in _globals.*) continue ;; esac
+        b="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+        if [ "$b" -ge 5120 ] && { [ -z "$pick" ] || [ "$b" -lt "$pick_b" ]; }; then
+            pick="$f"; pick_b="$b"
+        fi
+    done
+    if [ -z "$pick" ]; then
+        for f in "${files[@]}"; do
+            case "$(basename "$f")" in _globals.*) continue ;; esac
+            b="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+            if [ "$b" -gt "$pick_b" ]; then pick="$f"; pick_b="$b"; fi
+        done
+    fi
+    if [ -z "$pick" ]; then
+        warn "Verify: no database dump suitable for a restore test."
+        return 1
+    fi
+
+    local vdb="slbck_verify" dbname tables=""
+    dbname="$(basename "$pick")"; dbname="${dbname%%.sql.gz*}"
+    log "Verify: restore test of '$dbname' into temporary DB '$vdb'..."
+
+    case "$engine" in
+        mysql)
+            mysql_auth_setup
+            mysql_cmd -e "DROP DATABASE IF EXISTS \`$vdb\`; CREATE DATABASE \`$vdb\`" 2>>"$LOG_FILE"
+            decrypt_stream "$pick" | sed -E '/^CREATE DATABASE /d; /^USE /d' | mysql_cmd "$vdb" 2>>"$LOG_FILE"
+            local rc=("${PIPESTATUS[@]}")
+            tables="$(mysql_cmd --skip-column-names -e \
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$vdb'" 2>/dev/null)"
+            mysql_cmd -e "DROP DATABASE IF EXISTS \`$vdb\`" 2>>"$LOG_FILE"
+            mysql_auth_cleanup
+            if [ "${rc[0]}" -ne 0 ] || [ "${rc[2]}" -ne 0 ] || [ -z "$tables" ] || [ "$tables" -eq 0 ]; then
+                fail "Verify: restore test FAILED for '$dbname' (tables restored: ${tables:-0})."
+                return 1
+            fi ;;
+        postgresql)
+            run_as_postgres psql -d postgres -c "DROP DATABASE IF EXISTS $vdb" >/dev/null 2>>"$LOG_FILE"
+            run_as_postgres psql -d postgres -c "CREATE DATABASE $vdb" >/dev/null 2>>"$LOG_FILE"
+            decrypt_stream "$pick" \
+                | sed -E "/^DROP DATABASE /d; /^CREATE DATABASE /d; /^ALTER DATABASE /d; s/^\\\\connect .*/\\\\connect $vdb/" \
+                | run_as_postgres psql -d postgres >/dev/null 2>>"$LOG_FILE"
+            local prc=("${PIPESTATUS[@]}")
+            tables="$(run_as_postgres psql -d "$vdb" -At -c \
+                "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')" 2>/dev/null)"
+            run_as_postgres psql -d postgres -c "DROP DATABASE IF EXISTS $vdb" >/dev/null 2>>"$LOG_FILE"
+            if [ "${prc[0]}" -ne 0 ] || [ "${prc[2]}" -ne 0 ] || [ -z "$tables" ] || [ "$tables" -eq 0 ]; then
+                fail "Verify: restore test FAILED for '$dbname' (tables restored: ${tables:-0})."
+                return 1
+            fi ;;
+        *)  fail "Verify: no supported database engine found."; return 1 ;;
+    esac
+
+    log "Verify OK: '$dbname' restored into temp DB, $tables tables."
+    report "  Restore test: OK - '$dbname' restored into temp DB ($tables tables), temp DB dropped."
+    [ "$bad" -eq 0 ]
+}
+
+# Standalone 'slbck verify' - always sends a confirmation mail
+cmd_verify() {
+    need_root
+    REPORT="SLBCK restore test - $HOSTNAME_FQDN"$'\n'"Started: $(date '+%F %T')"$'\n\n'
+    ERRORS=0; WARNINGS=0
+    verify_run
+    local subject
+    if [ "$ERRORS" -eq 0 ]; then
+        subject="[SLBCK] VERIFY OK - restore test on $HOSTNAME_FQDN"
+    else
+        subject="[SLBCK] VERIFY ERROR - restore test on $HOSTNAME_FQDN"
+    fi
+    REPORT="${REPORT}"$'\n'"Finished: $(date '+%F %T')"$'\n'
+    send_mail "$subject" "$REPORT"
+    echo "----------------------------------------"
+    printf '%s\n' "$REPORT"
+    [ "$ERRORS" -eq 0 ]
+}
+
+# ------------------------------------------------------------------ update --
+cmd_update() {
+    need_root
+    local src=""
+    [ -f "$CONFIG_DIR/source_dir" ] && src="$(cat "$CONFIG_DIR/source_dir")"
+    if [ -z "$src" ] || [ ! -d "$src/.git" ]; then
+        echo "Source repo not found. Clone and reinstall:"
+        echo "  git clone https://github.com/saguarogit-cmzk/SLBCK.git && cd SLBCK && sudo ./install.sh"
+        return 1
+    fi
+    echo "Installed version: v$VERSION"
+    git -C "$src" pull --ff-only || { echo "git pull failed - fix manually in $src"; return 1; }
+    bash "$src/install.sh"
+    echo "Now installed: $("$SELF" version)"
+}
+
 # ------------------------------------------------------------------ backup --
 cmd_backup() {
     need_root
@@ -479,7 +735,8 @@ cmd_backup() {
         exit 1
     fi
 
-    local start engine dest db size count=0
+    local start engine dest db size ext count=0
+    ext="$(dump_ext)"
     start="$(date '+%F %T')"
     log "===== SLBCK backup started on $HOSTNAME_FQDN ====="
     report "SLBCK backup report - $HOSTNAME_FQDN"
@@ -492,7 +749,22 @@ cmd_backup() {
         return 1
     fi
     report "Engine: $engine (service running)"
+    [ "$ENCRYPT_ENABLED" = "yes" ] && report "Encryption: GPG AES256 enabled"
     report ""
+
+    if ! gpg_check; then
+        finish_backup "$engine"
+        return 1
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+    if ! check_disk_space; then
+        finish_backup "$engine"
+        return 1
+    fi
+
+    # remember the newest previous day for size sanity checks
+    PREV_DIR="$(ls -1d "$BACKUP_DIR"/????-??-?? 2>/dev/null | grep -v "/$TODAY\$" | tail -1)"
 
     dest="$BACKUP_DIR/$TODAY"
     mkdir -p "$dest"
@@ -507,10 +779,11 @@ cmd_backup() {
                 fail "Could not list MySQL databases (check credentials / socket auth)."
             fi
             for db in $dbs; do
-                if mysql_dump_db "$db" "$dest/${db}.sql.gz"; then
-                    size="$(du -h "$dest/${db}.sql.gz" | cut -f1)"
+                if mysql_dump_db "$db" "$dest/${db}.${ext}"; then
+                    size="$(du -h "$dest/${db}.${ext}" | cut -f1)"
                     log "Dumped $db ($size)"
                     report "  OK   $db ($size)"
+                    sanity_check_size "$db" "$dest/${db}.${ext}"
                     count=$((count+1))
                 else
                     fail "Dump failed for database: $db"
@@ -522,17 +795,18 @@ cmd_backup() {
             if [ -z "$dbs" ]; then
                 fail "Could not list PostgreSQL databases."
             fi
-            if pg_dump_globals "$dest/_globals.sql.gz"; then
+            if pg_dump_globals "$dest/_globals.${ext}"; then
                 log "Dumped PostgreSQL globals (roles/tablespaces)"
                 report "  OK   _globals (roles/tablespaces)"
             else
                 fail "Dump of PostgreSQL globals failed."
             fi
             for db in $dbs; do
-                if pg_dump_db "$db" "$dest/${db}.sql.gz"; then
-                    size="$(du -h "$dest/${db}.sql.gz" | cut -f1)"
+                if pg_dump_db "$db" "$dest/${db}.${ext}"; then
+                    size="$(du -h "$dest/${db}.${ext}" | cut -f1)"
                     log "Dumped $db ($size)"
                     report "  OK   $db ($size)"
+                    sanity_check_size "$db" "$dest/${db}.${ext}"
                     count=$((count+1))
                 else
                     fail "Dump failed for database: $db"
@@ -544,6 +818,12 @@ cmd_backup() {
     report "Databases dumped: $count"
     report "Local folder: $dest ($(du -sh "$dest" 2>/dev/null | cut -f1))"
     report ""
+
+    # weekly automatic restore test (result goes into the same mail)
+    if [ "$VERIFY_ENABLED" = "yes" ] && [ "$(date +%u)" = "$VERIFY_DAY" ] && [ "$count" -gt 0 ]; then
+        verify_run
+        report ""
+    fi
 
     apply_retention
     remote_send
@@ -567,9 +847,16 @@ finish_backup() {
     local scope="local+remote"
     [ "$REMOTE_ENABLED" != "yes" ] && scope="local-only"
     if [ "$ERRORS" -eq 0 ]; then
-        subject="[SLBCK] OK - backup on $HOSTNAME_FQDN ($TODAY) [$scope]"
-        log "===== SLBCK backup finished OK ====="
-        [ "$MAIL_ON" = "always" ] && send_mail "$subject" "$REPORT"
+        if [ "$WARNINGS" -gt 0 ]; then
+            subject="[SLBCK] OK with $WARNINGS warning(s) - backup on $HOSTNAME_FQDN ($TODAY) [$scope]"
+        else
+            subject="[SLBCK] OK - backup on $HOSTNAME_FQDN ($TODAY) [$scope]"
+        fi
+        log "===== SLBCK backup finished OK ($WARNINGS warnings) ====="
+        # warnings are always mailed, even with MAIL_ON=error
+        if [ "$MAIL_ON" = "always" ] || [ "$WARNINGS" -gt 0 ]; then
+            send_mail "$subject" "$REPORT"
+        fi
     else
         subject="[SLBCK] ERROR - backup on $HOSTNAME_FQDN ($TODAY) [$scope] - $ERRORS error(s)"
         log "===== SLBCK backup finished with $ERRORS error(s) ====="
@@ -589,6 +876,16 @@ DB_ENGINE="$DB_ENGINE"
 BACKUP_DIR="$BACKUP_DIR"
 RETENTION_DAYS="$RETENTION_DAYS"
 CRON_HOUR="$CRON_HOUR"
+MIN_FREE_MB="$MIN_FREE_MB"
+
+# GPG AES256 encryption of dumps - passphrase MUST also live in your
+# password manager: without it there is no restore!
+ENCRYPT_ENABLED="$ENCRYPT_ENABLED"
+ENCRYPT_PASSPHRASE='$ENCRYPT_PASSPHRASE'
+
+# Weekly restore test (1=Mon..7=Sun)
+VERIFY_ENABLED="$VERIFY_ENABLED"
+VERIFY_DAY="$VERIFY_DAY"
 
 MAIL_ENABLED="$MAIL_ENABLED"
 MAIL_TO="$MAIL_TO"
@@ -601,6 +898,7 @@ REMOTE_HOST="$REMOTE_HOST"
 REMOTE_PORT="$REMOTE_PORT"
 REMOTE_USER="$REMOTE_USER"
 REMOTE_PATH="$REMOTE_PATH"
+REMOTE_SUBDIR="$REMOTE_SUBDIR"
 SSH_KEY="$SSH_KEY"
 
 # MySQL credentials - leave empty to use socket auth as root (recommended)
@@ -666,10 +964,46 @@ cmd_setup() {
     BACKUP_DIR="$REPLY"
 
     echo
+    echo "GPG encryption (AES256): dumps are encrypted at rest, locally and on"
+    echo "the remote server. WITHOUT the passphrase there is NO restore - store"
+    echo "it in your password manager as well!"
+    ask "Encrypt dumps with GPG? (yes/no)" "$ENCRYPT_ENABLED"
+    ENCRYPT_ENABLED="$REPLY"
+    if [ "$ENCRYPT_ENABLED" = "yes" ]; then
+        if ! command -v gpg >/dev/null 2>&1; then
+            echo "Installing gnupg..."
+            pkg_install gnupg || { echo "gnupg install failed - encryption disabled."; ENCRYPT_ENABLED="no"; }
+        fi
+    fi
+    if [ "$ENCRYPT_ENABLED" = "yes" ]; then
+        local p1 p2
+        while :; do
+            read -r -s -p "Passphrase (min 12 chars, no single quotes): " p1; echo
+            if [ "${#p1}" -lt 12 ]; then echo "Too short - minimum 12 characters."; continue; fi
+            case "$p1" in *"'"*) echo "Single quotes are not allowed."; continue ;; esac
+            read -r -s -p "Repeat passphrase: " p2; echo
+            [ "$p1" = "$p2" ] && { ENCRYPT_PASSPHRASE="$p1"; break; }
+            echo "Passphrases do not match, try again."
+        done
+    fi
+
+    echo
+    echo "Weekly restore test: SLBCK restores one database into a temporary DB,"
+    echo "counts the tables and drops it - proof that backups are restorable."
+    while :; do
+        ask "Restore test day (1=Mon..7=Sun, 0=off)" "$VERIFY_DAY"
+        case "$REPLY" in
+            0) VERIFY_ENABLED="no"; break ;;
+            [1-7]) VERIFY_ENABLED="yes"; VERIFY_DAY="$REPLY"; break ;;
+            *) echo "Enter 0-7." ;;
+        esac
+    done
+
+    echo
     ask "Send e-mail notifications? (yes/no)" "$MAIL_ENABLED"
     MAIL_ENABLED="$REPLY"
     if [ "$MAIL_ENABLED" = "yes" ]; then
-        ask "Mail to (address)" "$MAIL_TO"
+        ask "Mail to (one or more addresses, comma separated)" "$MAIL_TO"
         MAIL_TO="$REPLY"
         ask "Mail from (empty = slbck@$HOSTNAME_FQDN)" "$MAIL_FROM"
         MAIL_FROM="$REPLY"
@@ -689,6 +1023,8 @@ cmd_setup() {
         ask "Remote SSH port" "$REMOTE_PORT";        REMOTE_PORT="$REPLY"
         ask "Remote user" "$REMOTE_USER";            REMOTE_USER="$REPLY"
         ask "Remote path" "$REMOTE_PATH";            REMOTE_PATH="$REPLY"
+        ask "Subfolder per server (auto = hostname '$(hostname -s)', empty = none)" "$REMOTE_SUBDIR"
+        REMOTE_SUBDIR="$REPLY"
         ask "SSH private key (empty = default root key)" "$SSH_KEY"
         SSH_KEY="$REPLY"
         echo "NOTE: key-based SSH auth must already work from this server (ssh-copy-id)."
@@ -714,7 +1050,9 @@ cmd_status() {
         echo "Backup dir: $BACKUP_DIR ($(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1 || echo '-'))"
         echo "Retention:  last $RETENTION_DAYS days"
         echo "Mail:       $MAIL_ENABLED ($MAIL_TO, on=$MAIL_ON)"
-        echo "Remote:     $REMOTE_ENABLED ($REMOTE_METHOD $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH)"
+        echo "Encryption: $ENCRYPT_ENABLED"
+        echo "Verify:     $VERIFY_ENABLED (restore test day: $VERIFY_DAY, 1=Mon..7=Sun)"
+        echo "Remote:     $REMOTE_ENABLED ($REMOTE_METHOD $REMOTE_USER@$REMOTE_HOST:$(remote_full_path))"
     else
         echo "Not configured yet - run: slbck setup"
     fi
@@ -749,7 +1087,11 @@ cmd_guide() {
    - MySQL/MariaDB auth: na Ubuntuu ostavi PRAZNO (socket auth kao root)
    - Sat backupa: 1-6 (01:00-06:00), backup se vrti svaki dan
    - Retencija: koliko dana ostaje lokalno (default 3)
-   - Mail: upisi adresu; ako server nema mail sustav, setup sam
+   - GPG enkripcija: opcionalno; passphrase min 12 znakova.
+     OBAVEZNO je spremi i u password manager - bez nje nema restora!
+   - Restore test: dan u tjednu kad SLBCK sam testira restore
+     (default nedjelja); rucno bilo kada: slbck verify
+   - Mail: jedna ili vise adresa (zarez); ako server nema mail sustav, setup sam
      instalira i podesi msmtp (treba ti SMTP relay: host/port/user/pass)
    - Remote: yes/no. Ako NEMAS vanjsku lokaciju, backup ostaje samo
      lokalno i mail ce to jasno pisati: [local-only].
@@ -761,6 +1103,12 @@ cmd_guide() {
      (ako root nema kljuc: sudo ssh-keygen -t ed25519)
    Zatim: slbck-setup -> 1 Setup -> Remote: yes (rsync preporuceno).
    rsync mirrora lokalni folder pa remote ima istu retenciju.
+   Subfolder "auto" = svaki server pise u svoj hostname folder.
+
+   HETZNER STORAGE BOX: u Robot panelu ukljuci "SSH support" i
+   snapshotove, pa: rsync, host uXXXXX.your-storagebox.de, PORT 23,
+   user uXXXXX (najbolje sub-account po serveru), path /home/backup.
+   Kljuc: ssh-copy-id -p 23 uXXXXX@uXXXXX.your-storagebox.de
 
 4) PRVI TEST (obavezno nakon setupa)
    sudo slbck backup           # rucni backup odmah
@@ -798,7 +1146,9 @@ cmd_menu() {
         echo "  5) Status"
         echo "  6) Service check"
         echo "  7) Test mail"
-        echo "  8) Upute / install & setup guide"
+        echo "  8) Verify / restore test now"
+        echo "  9) Update SLBCK from git"
+        echo " 10) Upute / install & setup guide"
         echo "  q) Quit"
         read -r -p "Choose: " choice
         case "$choice" in
@@ -811,7 +1161,9 @@ cmd_menu() {
             7) send_mail "[SLBCK] Test mail from $HOSTNAME_FQDN" \
                    "This is a SLBCK test mail. If you can read this, mail works." \
                    && echo "Test mail sent to $MAIL_TO" ;;
-            8) cmd_guide ;;
+            8) cmd_verify; ERRORS=0; WARNINGS=0 ;;
+            9) cmd_update ;;
+            10) cmd_guide ;;
             q|Q) exit 0 ;;
             *) echo "Unknown option." ;;
         esac
@@ -837,6 +1189,8 @@ case "$CMD" in
     send)      need_root; remote_send; [ "$ERRORS" -eq 0 ] || exit 1 ;;
     pull)      need_root; remote_pull ;;
     status)    cmd_status ;;
+    verify)    cmd_verify ;;
+    update)    cmd_update ;;
     guide|upute) cmd_guide ;;
     test-mail) send_mail "[SLBCK] Test mail from $HOSTNAME_FQDN" \
                   "This is a SLBCK test mail. If you can read this, mail works." \
@@ -852,6 +1206,9 @@ Usage: slbck <command>   (no command on a terminal = interactive menu)
   setup       Setup wizard (config + cron, installs mail transport if missing)
   backup      Run backup now (check, dump all DBs, retention, remote, mail)
   restore     Interactive restore of one database (local or pulled from remote)
+  verify      Restore test now: integrity of all dumps + real restore of one
+              database into a temp DB, with confirmation mail
+  update      Update SLBCK from git and reinstall
   check       Database service check only
   send        (Re)send local backups to remote server
   pull        Pull backups from remote server to local backup dir
