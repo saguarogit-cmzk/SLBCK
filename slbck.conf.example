@@ -1,0 +1,47 @@
+# SLBCK - SaguaroLocalBackup configuration
+# Location on server: /etc/slbck/slbck.conf (chmod 600)
+# Easiest way to configure: run 'slbck setup'
+
+# Database engine: auto | mysql | mariadb | postgresql
+# (mariadb uses the same toolchain as mysql - both are fully supported)
+DB_ENGINE="auto"
+
+# Where per-database gzipped dumps are stored (one folder per day)
+BACKUP_DIR="/var/backups/slbck"
+
+# Keep last N daily backup folders locally
+RETENTION_DAYS="3"
+
+# Hour of the daily cron run (1-6 = 01:00-06:00 server local time)
+CRON_HOUR="3"
+
+# --- E-mail notifications ---------------------------------------------------
+# If the server has no mail transport, 'slbck setup' offers to install and
+# configure msmtp (lightweight SMTP relay) automatically.
+MAIL_ENABLED="no"
+MAIL_TO=""
+# Empty = slbck@<hostname>
+MAIL_FROM=""
+# always = mail on every backup, error = mail only on failure
+MAIL_ON="always"
+
+# --- Off-server copy -------------------------------------------------------
+REMOTE_ENABLED="no"
+# rsync = mirrors the whole local backup dir (remote keeps same retention)
+# sftp  = uploads today's folder only
+REMOTE_METHOD="rsync"
+REMOTE_HOST=""
+REMOTE_PORT="22"
+REMOTE_USER=""
+REMOTE_PATH=""
+# Optional SSH private key; empty = root's default key. Key auth must already
+# work non-interactively (ssh-copy-id) - SLBCK never stores SSH passwords.
+SSH_KEY=""
+
+# --- MySQL credentials -----------------------------------------------------
+# Leave empty to use unix socket auth as root (default on Debian/Ubuntu/MariaDB).
+# Otherwise create a dedicated backup user, e.g.:
+#   CREATE USER 'slbck'@'localhost' IDENTIFIED BY '...';
+#   GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER, PROCESS ON *.* TO 'slbck'@'localhost';
+MYSQL_USER=""
+MYSQL_PASS=""
