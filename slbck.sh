@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.1.0"
+VERSION="1.2.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -548,6 +548,15 @@ cmd_backup() {
     apply_retention
     remote_send
 
+    # Make it explicit in the mail WHERE the backups ended up
+    report ""
+    if [ "$REMOTE_ENABLED" = "yes" ]; then
+        report "Storage: local ($dest) + remote copy ($REMOTE_METHOD -> $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH)"
+    else
+        report "Storage: LOCAL ONLY - no remote location configured."
+        report "Backups exist only on this server: $dest"
+    fi
+
     finish_backup "$engine"
 }
 
@@ -555,12 +564,14 @@ finish_backup() {
     local subject
     report ""
     report "Finished: $(date '+%F %T')"
+    local scope="local+remote"
+    [ "$REMOTE_ENABLED" != "yes" ] && scope="local-only"
     if [ "$ERRORS" -eq 0 ]; then
-        subject="[SLBCK] OK - backup on $HOSTNAME_FQDN ($TODAY)"
+        subject="[SLBCK] OK - backup on $HOSTNAME_FQDN ($TODAY) [$scope]"
         log "===== SLBCK backup finished OK ====="
         [ "$MAIL_ON" = "always" ] && send_mail "$subject" "$REPORT"
     else
-        subject="[SLBCK] ERROR - backup on $HOSTNAME_FQDN ($TODAY) - $ERRORS error(s)"
+        subject="[SLBCK] ERROR - backup on $HOSTNAME_FQDN ($TODAY) [$scope] - $ERRORS error(s)"
         log "===== SLBCK backup finished with $ERRORS error(s) ====="
         send_mail "$subject" "$REPORT"
         exit 1
@@ -720,6 +731,57 @@ cmd_status() {
     tail -10 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' || echo "  (no log yet)"
 }
 
+# ------------------------------------------------------------------- guide --
+cmd_guide() {
+    cat <<'EOF'
+==========================================================================
+ SLBCK - Upute za instalaciju i postavljanje (Ubuntu)
+==========================================================================
+
+1) INSTALACIJA (na svakom serveru)
+   git clone https://github.com/saguarogit-cmzk/SLBCK.git
+   cd SLBCK && sudo ./install.sh
+   sudo slbck-setup            # otvara glavni izbornik
+
+2) POSTAVLJANJE (izbornik -> 1 Setup)
+   Carobnjak pita redom:
+   - Engine: ostavi "auto" (sam prepozna MySQL/MariaDB/PostgreSQL)
+   - MySQL/MariaDB auth: na Ubuntuu ostavi PRAZNO (socket auth kao root)
+   - Sat backupa: 1-6 (01:00-06:00), backup se vrti svaki dan
+   - Retencija: koliko dana ostaje lokalno (default 3)
+   - Mail: upisi adresu; ako server nema mail sustav, setup sam
+     instalira i podesi msmtp (treba ti SMTP relay: host/port/user/pass)
+   - Remote: yes/no. Ako NEMAS vanjsku lokaciju, backup ostaje samo
+     lokalno i mail ce to jasno pisati: [local-only].
+   Setup sam zapise /etc/slbck/slbck.conf i cron /etc/cron.d/slbck.
+
+3) VANJSKA LOKACIJA (kad je budes imao)
+   Na backup serveru napravi usera i folder, pa s ovog servera:
+     sudo ssh-copy-id -i /root/.ssh/id_ed25519 user@backupserver
+     (ako root nema kljuc: sudo ssh-keygen -t ed25519)
+   Zatim: slbck-setup -> 1 Setup -> Remote: yes (rsync preporuceno).
+   rsync mirrora lokalni folder pa remote ima istu retenciju.
+
+4) PRVI TEST (obavezno nakon setupa)
+   sudo slbck backup           # rucni backup odmah
+   sudo slbck test-mail        # provjeri da mail stize
+   sudo slbck status           # config, cron, zadnji logovi
+
+5) RESTORE
+   sudo slbck restore          # ili izbornik -> 3
+   Bira se dan pa baza; prije prepisivanja moras utipkati ime baze.
+   Ako je remote konfiguriran, nudi povlacenje backupa s remote servera.
+
+6) GDJE JE STO
+   Backup:  /var/backups/slbck/YYYY-MM-DD/baza.sql.gz
+   Config:  /etc/slbck/slbck.conf   (chmod 600)
+   Cron:    /etc/cron.d/slbck
+   Log:     /var/log/slbck.log
+   Mail:    /etc/msmtprc (ako ga je setup instalirao)
+==========================================================================
+EOF
+}
+
 # -------------------------------------------------------------------- menu --
 cmd_menu() {
     need_root
@@ -736,6 +798,7 @@ cmd_menu() {
         echo "  5) Status"
         echo "  6) Service check"
         echo "  7) Test mail"
+        echo "  8) Upute / install & setup guide"
         echo "  q) Quit"
         read -r -p "Choose: " choice
         case "$choice" in
@@ -748,6 +811,7 @@ cmd_menu() {
             7) send_mail "[SLBCK] Test mail from $HOSTNAME_FQDN" \
                    "This is a SLBCK test mail. If you can read this, mail works." \
                    && echo "Test mail sent to $MAIL_TO" ;;
+            8) cmd_guide ;;
             q|Q) exit 0 ;;
             *) echo "Unknown option." ;;
         esac
@@ -773,6 +837,7 @@ case "$CMD" in
     send)      need_root; remote_send; [ "$ERRORS" -eq 0 ] || exit 1 ;;
     pull)      need_root; remote_pull ;;
     status)    cmd_status ;;
+    guide|upute) cmd_guide ;;
     test-mail) send_mail "[SLBCK] Test mail from $HOSTNAME_FQDN" \
                   "This is a SLBCK test mail. If you can read this, mail works." \
                   && echo "Test mail sent to $MAIL_TO" ;;
@@ -791,6 +856,7 @@ Usage: slbck <command>   (no command on a terminal = interactive menu)
   send        (Re)send local backups to remote server
   pull        Pull backups from remote server to local backup dir
   status      Show configuration and recent activity
+  guide       Install & setup instructions (hrvatski / step-by-step)
   test-mail   Send a test e-mail
   version     Show version
 EOF

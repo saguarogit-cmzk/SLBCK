@@ -62,6 +62,7 @@ Sve opcije rade i direktno iz CLI-ja (za skriptiranje):
 | `slbck pull` | Povuci backupe s remote servera u lokalni folder |
 | `slbck check` | Samo provjera database servisa |
 | `slbck status` | Stanje: config, cron, zauzeće diska, zadnji logovi |
+| `slbck guide` | Upute za instalaciju i postavljanje (korak po korak) |
 | `slbck test-mail` | Pošalji testni mail |
 
 ## Restore
@@ -107,6 +108,9 @@ zcat baza.sql.gz | sudo -u postgres psql -d postgres   # PostgreSQL
 - Ako **ne postoji ništa**, setup nudi instalaciju **msmtp-a** i pita za SMTP
   relay (host, port, user, pass, from) te sam zapiše `/etc/msmtprc` (chmod 600).
 - `MAIL_ON="always"` šalje mail nakon svakog backupa, `"error"` samo kod greške.
+- Subject i tijelo maila jasno kažu **gdje je backup završio**: `[local-only]`
+  ako remote nije konfiguriran (backup postoji samo na serveru), odnosno
+  `[local+remote]` s adresom vanjske lokacije kad je remote uključen.
 - Test: `slbck test-mail`.
 
 ## Remote kopija
