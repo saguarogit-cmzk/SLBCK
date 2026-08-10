@@ -66,6 +66,7 @@ Sve opcije rade i direktno iz CLI-ja (za skriptiranje):
 | `slbck backup` | Backup odmah (check → dump → retencija → remote → mail) |
 | `slbck restore` | Interaktivni restore jedne baze (izbor dana → izbor baze) |
 | `slbck verify` | Restore test odmah: integritet svih dumpova + stvarni restore jedne baze u temp DB, s potvrdom mailom |
+| `slbck health` | Health check odmah: DB + web servisi + aplikacijski URL-ovi (mail samo kod greške) |
 | `slbck update` | Povuci novu verziju SLBCK-a s gita i reinstaliraj |
 | `slbck send` | (Ponovno) pošalji lokalne backupe na remote server |
 | `slbck pull` | Povuci backupe s remote servera u lokalni folder |
@@ -130,6 +131,18 @@ Ako je GPG enkripcija uključena, isti pristup radi uz jedan korak više
   ako remote nije konfiguriran (backup postoji samo na serveru), odnosno
   `[local+remote]` s adresom vanjske lokacije kad je remote uključen.
 - Test: `slbck test-mail`.
+
+## Health check (jutarnji mail = mali monitoring)
+
+Nakon svakog backupa SLBCK provjeri **jesu li servisi zbog kojih server
+postoji i dalje živi**: database engine, web server (apache2/nginx —
+auto-detekcija ili lista u `HEALTH_SERVICES`) i opcionalno aplikacijski
+URL-ovi (`HEALTH_URLS`, očekuje HTTP 2xx/3xx). Pad bilo čega = ERROR mail u
+istom trenutku — u 02:05, ne kad se korisnici jave ujutro. Ručno bilo kada:
+`slbck health`.
+
+Rsync prijenosi koriste najbrži SSH cipher (aes128-gcm s fallbackom), a po
+serveru se mogu dodati opcije kroz `RSYNC_EXTRA_OPTS` (npr. `--bwlimit=20M`).
 
 ## Restore test (verify)
 

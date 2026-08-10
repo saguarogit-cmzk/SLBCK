@@ -32,6 +32,20 @@ ENCRYPT_PASSPHRASE=''
 VERIFY_ENABLED="yes"
 VERIFY_DAY="7"          # 1=Mon .. 7=Sun
 
+# --- Health check after each backup -----------------------------------------
+# Verifies the DB engine and web server are running; failures are ERRORS so
+# the morning backup mail doubles as a monitoring report.
+HEALTH_ENABLED="yes"
+# auto = detect apache2/nginx/httpd; or an explicit systemd unit list
+HEALTH_SERVICES="auto"
+# Application URLs to check, space separated; expects HTTP 2xx/3xx, e.g.
+# HEALTH_URLS="https://www.example.com https://api.example.com/health"
+HEALTH_URLS=""
+
+# --- rsync tuning (optional) ------------------------------------------------
+# Extra options appended to every remote rsync, e.g. "--bwlimit=20M"
+RSYNC_EXTRA_OPTS=""
+
 # --- Folder backup ----------------------------------------------------------
 # ARCHIVE: small folders (e.g. /etc) -> daily tar.gz stored WITH the DB dumps
 # (same retention, mirror, encryption, verify). Space separated. Keep small!

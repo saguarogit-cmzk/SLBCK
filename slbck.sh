@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.4.2"
+VERSION="1.5.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -57,6 +57,14 @@ VERIFY_DAY="7"              # 1=Mon .. 7=Sun (day when restore test runs)
 #   so it gets the same retention, mirror, encryption and verify.
 # - MIRROR (big folders, e.g. /var/www): rsynced DIRECTLY to the remote server,
 #   never stored locally. History comes from Storage Box snapshots.
+# Health check after each backup: DB + web services running, app URLs alive
+HEALTH_ENABLED="yes"
+HEALTH_SERVICES="auto"      # auto = detect apache2/nginx/httpd, or explicit list
+HEALTH_URLS=""              # space separated URLs, expect HTTP 2xx/3xx
+
+# Extra options appended to every remote rsync (tuning per server, optional)
+RSYNC_EXTRA_OPTS=""
+
 ARCHIVE_DIRS=""             # space separated, e.g. "/etc /root"
 FOLDERS_ENABLED="no"        # yes = mirror folders from folders.conf to remote
 FOLDERS_MAX_GB="50"         # warn in mail when a mirrored folder exceeds this
@@ -410,6 +418,15 @@ apply_retention() {
 }
 
 # ------------------------------------------------------------------ remote --
+# Shared SSH options for all remote transfers. aes128-gcm is the fastest
+# cipher on AES-NI CPUs; the comma list keeps fallbacks for older sshd.
+ssh_base_opts() {
+    local o="-p $REMOTE_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    o="$o -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+    [ -n "$SSH_KEY" ] && o="$o -i $SSH_KEY"
+    echo "$o"
+}
+
 # Effective remote path: REMOTE_SUBDIR keeps each server in its own folder
 # when multiple servers share one target (e.g. one Hetzner Storage Box).
 remote_full_path() {
@@ -426,8 +443,8 @@ remote_send() {
         fail "Remote is enabled but REMOTE_HOST/REMOTE_USER/REMOTE_PATH is not set."
         return 1
     fi
-    local ssh_opts="-p $REMOTE_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-    [ -n "$SSH_KEY" ] && ssh_opts="$ssh_opts -i $SSH_KEY"
+    local ssh_opts
+    ssh_opts="$(ssh_base_opts)"
     local rpath
     rpath="$(remote_full_path)"
 
@@ -439,8 +456,9 @@ remote_send() {
             # /.ssh + /.zfs - when REMOTE_PATH is the login home (e.g. Hetzner
             # subaccount base dir), deleting .ssh would wipe authorized_keys
             # and lock us out.
+            # shellcheck disable=SC2086
             if rsync -az --delete --exclude='/folders' --exclude='/.ssh' --exclude='/.zfs' \
-                -e "ssh $ssh_opts" \
+                $RSYNC_EXTRA_OPTS -e "ssh $ssh_opts" \
                 "$BACKUP_DIR/" "$REMOTE_USER@$REMOTE_HOST:$rpath/" >>"$LOG_FILE" 2>&1; then
                 log "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
                 report "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
@@ -479,8 +497,8 @@ remote_pull() {
         echo "Remote is not configured - nothing to pull."
         return 1
     fi
-    local ssh_opts="-p $REMOTE_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-    [ -n "$SSH_KEY" ] && ssh_opts="$ssh_opts -i $SSH_KEY"
+    local ssh_opts
+    ssh_opts="$(ssh_base_opts)"
     local rpath
     rpath="$(remote_full_path)"
     mkdir -p "$BACKUP_DIR"
@@ -543,8 +561,7 @@ folders_mirror() {
         return 1
     fi
     local ssh_opts rbase dirs=() dir name size_mb ex_opt=() scaffold
-    ssh_opts="-p $REMOTE_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-    [ -n "$SSH_KEY" ] && ssh_opts="$ssh_opts -i $SSH_KEY"
+    ssh_opts="$(ssh_base_opts)"
     rbase="$(remote_full_path)"
 
     while IFS= read -r dir; do
@@ -582,7 +599,8 @@ folders_mirror() {
         if [ "${size_mb:-0}" -gt $((FOLDERS_MAX_GB * 1024)) ]; then
             warn "Folder '$dir' is ${size_mb} MB (limit FOLDERS_MAX_GB=${FOLDERS_MAX_GB} GB) - check what grew."
         fi
-        if rsync -az "${del_opt[@]}" "${ex_opt[@]}" -e "ssh $ssh_opts" \
+        # shellcheck disable=SC2086
+        if rsync -az "${del_opt[@]}" "${ex_opt[@]}" $RSYNC_EXTRA_OPTS -e "ssh $ssh_opts" \
             "$dir/" "$REMOTE_USER@$REMOTE_HOST:$rbase/folders/$name/" >>"$LOG_FILE" 2>&1; then
             log "Folder mirror OK: $dir (${size_mb} MB)"
             report "  OK   $dir (${size_mb} MB) -> folders/$name/"
@@ -711,6 +729,69 @@ cmd_restore() {
     esac
 }
 
+# ------------------------------------------------------------------ health --
+# After the backup: are the services this server exists for still running?
+# DB engine + web server (auto-detected or HEALTH_SERVICES list) + optional
+# application URLs (HEALTH_URLS, expect HTTP 2xx/3xx). Failures are ERRORS -
+# the morning mail doubles as a monitoring report.
+health_check() {
+    [ "$HEALTH_ENABLED" = "yes" ] || return 0
+    report "Service health:"
+    local engine svc ok services="" url code
+    engine="$(detect_engine)"
+
+    case "$engine" in
+        mysql)
+            ok=no
+            for svc in mysql mysqld mariadb; do
+                systemctl is-active --quiet "$svc" 2>/dev/null && { ok=yes; break; }
+            done
+            if [ "$ok" = "yes" ]; then report "  OK   database ($svc active)"
+            else fail "Health: MySQL/MariaDB service is DOWN!"; fi ;;
+        postgresql)
+            if systemctl is-active --quiet postgresql 2>/dev/null; then
+                report "  OK   database (postgresql active)"
+            else fail "Health: PostgreSQL service is DOWN!"; fi ;;
+    esac
+
+    if [ "$HEALTH_SERVICES" = "auto" ]; then
+        for svc in apache2 nginx httpd; do
+            systemctl is-enabled --quiet "$svc" 2>/dev/null && services="$services $svc"
+        done
+    else
+        services="$HEALTH_SERVICES"
+    fi
+    for svc in $services; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            report "  OK   $svc active"
+        else
+            fail "Health: service '$svc' is NOT running!"
+        fi
+    done
+
+    for url in $HEALTH_URLS; do
+        code="$(curl -ksL -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)"
+        case "$code" in
+            2*|3*) report "  OK   $url (HTTP $code)" ;;
+            *)     fail "Health: $url returned HTTP ${code:-000}!" ;;
+        esac
+    done
+}
+
+# Standalone 'slbck health' - prints the result, mails only on failure
+cmd_health() {
+    need_root
+    REPORT="SLBCK health check - $HOSTNAME_FQDN ($(date '+%F %T'))"$'\n\n'
+    ERRORS=0; WARNINGS=0
+    HEALTH_ENABLED="yes"
+    health_check
+    printf '%s\n' "$REPORT"
+    if [ "$ERRORS" -gt 0 ]; then
+        send_mail "[SLBCK] HEALTH ERROR on $HOSTNAME_FQDN" "$REPORT"
+        return 1
+    fi
+}
+
 # ------------------------------------------------------------------ verify --
 # Restore test with confirmation: checks archive integrity of every dump in
 # the newest backup day, then REALLY restores one database into a temporary
@@ -743,9 +824,10 @@ verify_run() {
     report "  Archive integrity: $(( ${#files[@]} - bad ))/${#files[@]} OK"
 
     # pick the smallest real dump for the restore test (fast); skip _globals
+    # and the system 'mysql' DB - prefer an application database
     local pick="" pick_b=0 b
     for f in "${files[@]}"; do
-        case "$(basename "$f")" in _globals.*|_files-*) continue ;; esac
+        case "$(basename "$f")" in _globals.*|_files-*|mysql.sql.gz*) continue ;; esac
         b="$(stat -c %s "$f" 2>/dev/null || echo 0)"
         if [ "$b" -ge 5120 ] && { [ -z "$pick" ] || [ "$b" -lt "$pick_b" ]; }; then
             pick="$f"; pick_b="$b"
@@ -950,6 +1032,11 @@ cmd_backup() {
         folders_mirror
     fi
 
+    if [ "$HEALTH_ENABLED" = "yes" ]; then
+        report ""
+        health_check
+    fi
+
     # Make it explicit in the mail WHERE the backups ended up
     report ""
     if [ "$REMOTE_ENABLED" = "yes" ]; then
@@ -1038,6 +1125,14 @@ ENCRYPT_PASSPHRASE='$ENCRYPT_PASSPHRASE'
 # Weekly restore test (1=Mon..7=Sun)
 VERIFY_ENABLED="$VERIFY_ENABLED"
 VERIFY_DAY="$VERIFY_DAY"
+
+# Health check after each backup (services + application URLs)
+HEALTH_ENABLED="$HEALTH_ENABLED"
+HEALTH_SERVICES="$HEALTH_SERVICES"
+HEALTH_URLS="$HEALTH_URLS"
+
+# Extra rsync options for remote transfers (tuning, optional)
+RSYNC_EXTRA_OPTS="$RSYNC_EXTRA_OPTS"
 
 # Folder backup: archive = daily tar.gz with the DB dumps;
 # mirror = folders from $FOLDERS_FILE rsynced directly to remote
@@ -1148,6 +1243,16 @@ cmd_setup() {
     fi
 
     echo
+    echo "Health check after each backup: verifies DB and web server services"
+    echo "are running; optionally checks application URLs (expects HTTP 2xx/3xx)."
+    ask "Health check enabled? (yes/no)" "$HEALTH_ENABLED"
+    HEALTH_ENABLED="$REPLY"
+    if [ "$HEALTH_ENABLED" = "yes" ]; then
+        ask "URLs to check (space separated, empty = none)" "$HEALTH_URLS"
+        HEALTH_URLS="$REPLY"
+    fi
+
+    echo
     echo "Weekly restore test: SLBCK restores one database into a temporary DB,"
     echo "counts the tables and drops it - proof that backups are restorable."
     while :; do
@@ -1234,6 +1339,7 @@ cmd_status() {
         echo "Mail:       $MAIL_ENABLED ($MAIL_TO, on=$MAIL_ON)"
         echo "Encryption: $ENCRYPT_ENABLED"
         echo "Verify:     $VERIFY_ENABLED (restore test day: $VERIFY_DAY, 1=Mon..7=Sun)"
+        echo "Health:     $HEALTH_ENABLED (services: $HEALTH_SERVICES; urls: ${HEALTH_URLS:-none})"
         echo "Archives:   ${ARCHIVE_DIRS:-none}"
         echo "Mirror:     $FOLDERS_ENABLED ($FOLDERS_FILE, warn > ${FOLDERS_MAX_GB} GB)"
         echo "Remote:     $REMOTE_ENABLED ($REMOTE_METHOD $REMOTE_USER@$REMOTE_HOST:$(remote_full_path))"
@@ -1351,7 +1457,7 @@ cmd_menu() {
         echo "  3) Restore a database"
         echo "  4) Send backups to remote server"
         echo "  5) Status"
-        echo "  6) Service check"
+        echo "  6) Health check (services + URLs)"
         echo "  7) Test mail"
         echo "  8) Verify / restore test now"
         echo "  9) Update SLBCK from git"
@@ -1364,7 +1470,7 @@ cmd_menu() {
             3) cmd_restore ;;
             4) remote_send; ERRORS=0 ;;
             5) cmd_status ;;
-            6) service_check "$(detect_engine)"; ERRORS=0 ;;
+            6) cmd_health; ERRORS=0; WARNINGS=0 ;;
             7) send_mail "[SLBCK] Test mail from $HOSTNAME_FQDN" \
                    "This is a SLBCK test mail. If you can read this, mail works." \
                    && echo "Test mail sent to $MAIL_TO" ;;
@@ -1393,6 +1499,7 @@ case "$CMD" in
     backup)    cmd_backup ;;
     restore)   cmd_restore ;;
     check)     need_root; service_check "$(detect_engine)" ;;
+    health)    cmd_health ;;
     send)      need_root; remote_send; [ "$ERRORS" -eq 0 ] || exit 1 ;;
     pull)      need_root; remote_pull ;;
     status)    cmd_status ;;
@@ -1416,6 +1523,7 @@ Usage: slbck <command>   (no command on a terminal = interactive menu)
   verify      Restore test now: integrity of all dumps + real restore of one
               database into a temp DB, with confirmation mail
   update      Update SLBCK from git and reinstall
+  health      Health check now: DB + web services + application URLs
   check       Database service check only
   send        (Re)send local backups to remote server
   pull        Pull backups from remote server to local backup dir
