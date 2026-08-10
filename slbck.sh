@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.4.0"
+VERSION="1.4.2"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -435,9 +435,12 @@ remote_send() {
         rsync)
             if ! command -v rsync >/dev/null 2>&1; then fail "rsync is not installed."; return 1; fi
             # Mirror local backup dir (local retention == remote retention).
-            # /folders on the remote belongs to folders_mirror - protect it
-            # from --delete.
-            if rsync -az --delete --exclude='/folders' -e "ssh $ssh_opts" \
+            # Protect from --delete: /folders (belongs to folders_mirror) and
+            # /.ssh + /.zfs - when REMOTE_PATH is the login home (e.g. Hetzner
+            # subaccount base dir), deleting .ssh would wipe authorized_keys
+            # and lock us out.
+            if rsync -az --delete --exclude='/folders' --exclude='/.ssh' --exclude='/.zfs' \
+                -e "ssh $ssh_opts" \
                 "$BACKUP_DIR/" "$REMOTE_USER@$REMOTE_HOST:$rpath/" >>"$LOG_FILE" 2>&1; then
                 log "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
                 report "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
