@@ -126,10 +126,14 @@ Ako je GPG enkripcija uključena, isti pristup radi uz jedan korak više
 - Ako na serveru već postoji `sendmail`/`mailx`/MTA, koristi se postojeći.
 - Ako **ne postoji ništa**, setup nudi instalaciju **msmtp-a** i pita za SMTP
   relay (host, port, user, pass, from) te sam zapiše `/etc/msmtprc` (chmod 600).
-- `MAIL_ON="always"` šalje mail nakon svakog backupa, `"error"` samo kod greške.
-- Subject i tijelo maila jasno kažu **gdje je backup završio**: `[local-only]`
-  ako remote nije konfiguriran (backup postoji samo na serveru), odnosno
-  `[local+remote]` s adresom vanjske lokacije kad je remote uključen.
+- `MAIL_ON="always"` šalje mail nakon svakog backupa, `"error"` samo kod greške
+  (upozorenja se uvijek šalju).
+- Izvještaj je **na hrvatskom i prikladan za slanje klijentu na znanje**:
+  subject `[SLBCK] <server> backup OK - datum`, tijelo s sekcijama Klijent/
+  Server/trajanje, Baze, Konfiguracija, Podaci, Pohrana i Provjera servisa.
+  Tehnički detalji vanjskog servera (host/user) ne prikazuju se u mailu —
+  ostaju samo u logu na serveru. `OWNER="ime-klijenta"` u configu puni polje
+  "Klijent:".
 - Test: `slbck test-mail`.
 
 ## Health check (jutarnji mail = mali monitoring)

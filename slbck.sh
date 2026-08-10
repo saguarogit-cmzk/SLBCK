@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.5.0"
+VERSION="1.6.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -25,6 +25,7 @@ CRON_FILE="/etc/cron.d/slbck"
 SELF="/usr/local/bin/slbck"
 
 # ---------------------------------------------------------------- defaults --
+OWNER=""                    # customer/owner name, shown as "Klijent:" in mail
 DB_ENGINE="auto"            # auto | mysql | mariadb | postgresql
 BACKUP_DIR="/var/backups/slbck"
 RETENTION_DAYS="3"          # keep last N daily backup folders locally
@@ -77,10 +78,13 @@ FOLDER_EXCLUDES_FILE="$CONFIG_DIR/folder-excludes.conf"
 [ -f "$CONFIG" ] && . "$CONFIG"
 
 HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
+HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
 TODAY="$(date +%F)"
 REPORT=""
 ERRORS=0
 WARNINGS=0
+START_EPOCH=0
+REMOTE_RESULT=""
 
 # ---------------------------------------------------------------- helpers ---
 log() {
@@ -91,9 +95,9 @@ log() {
 
 report() { REPORT="${REPORT}$*"$'\n'; }
 
-fail() { ERRORS=$((ERRORS+1)); log "ERROR: $*"; report "ERROR: $*"; }
+fail() { ERRORS=$((ERRORS+1)); log "ERROR: $*"; report "GREŠKA: $*"; }
 
-warn() { WARNINGS=$((WARNINGS+1)); log "WARNING: $*"; report "WARNING: $*"; }
+warn() { WARNINGS=$((WARNINGS+1)); log "WARNING: $*"; report "UPOZORENJE: $*"; }
 
 need_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -377,10 +381,10 @@ check_disk_space() {
     req_mb=$(( last_mb * 2 ))
     [ "$req_mb" -lt "$MIN_FREE_MB" ] && req_mb="$MIN_FREE_MB"
     if [ "$free_mb" -lt "$req_mb" ]; then
-        fail "Not enough disk space: ${free_mb} MB free, ${req_mb} MB required. Backup aborted."
+        fail "Nedovoljno prostora na disku: ${free_mb} MB slobodno, potrebno ${req_mb} MB. Backup prekinut."
         return 1
     fi
-    report "Disk space OK: ${free_mb} MB free (required: ${req_mb} MB)"
+    log "Disk space OK: ${free_mb} MB free (required: ${req_mb} MB)"
 }
 
 # Warn if a dump is suspiciously small: near-empty, or <50% of the same
@@ -390,7 +394,7 @@ sanity_check_size() {
     local db="$1" f="$2" new_b prev_f prev_b
     new_b="$(stat -c %s "$f" 2>/dev/null || echo 0)"
     if [ "$new_b" -lt 200 ]; then
-        warn "Dump of '$db' is suspiciously small (${new_b} bytes)."
+        warn "Dump baze '$db' je sumnjivo malen (${new_b} B)."
         return 0
     fi
     [ -n "$PREV_DIR" ] || return 0
@@ -398,7 +402,7 @@ sanity_check_size() {
     [ -n "$prev_f" ] || return 0
     prev_b="$(stat -c %s "$prev_f" 2>/dev/null || echo 0)"
     if [ "$prev_b" -gt 0 ] && [ "$new_b" -lt $((prev_b / 2)) ]; then
-        warn "Dump of '$db' is less than 50% of the previous one (${new_b} vs ${prev_b} bytes) - please verify."
+        warn "Dump baze '$db' je manji od 50% jučerašnjeg (${new_b} vs ${prev_b} B) - provjeriti."
     fi
 }
 
@@ -412,7 +416,6 @@ apply_retention() {
         if [[ "$name" < "$cutoff" ]]; then
             rm -rf "$dir"
             log "Retention: removed old backup $name"
-            report "Retention: removed old backup $name"
         fi
     done
 }
@@ -439,8 +442,9 @@ remote_full_path() {
 
 remote_send() {
     [ "$REMOTE_ENABLED" = "yes" ] || return 0
+    REMOTE_RESULT="GREŠKA"
     if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_USER" ] || [ -z "$REMOTE_PATH" ]; then
-        fail "Remote is enabled but REMOTE_HOST/REMOTE_USER/REMOTE_PATH is not set."
+        fail "Vanjski backup server je uključen, ali nije konfiguriran (host/user/path)."
         return 1
     fi
     local ssh_opts
@@ -461,9 +465,9 @@ remote_send() {
                 $RSYNC_EXTRA_OPTS -e "ssh $ssh_opts" \
                 "$BACKUP_DIR/" "$REMOTE_USER@$REMOTE_HOST:$rpath/" >>"$LOG_FILE" 2>&1; then
                 log "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
-                report "Remote sync OK (rsync -> $REMOTE_HOST:$rpath)"
+                REMOTE_RESULT="OK"
             else
-                fail "rsync to $REMOTE_HOST failed (see $LOG_FILE)."
+                fail "Slanje na vanjski backup server nije uspjelo (detalji: $LOG_FILE)."
                 return 1
             fi ;;
         sftp)
@@ -480,11 +484,11 @@ remote_send() {
             # shellcheck disable=SC2086
             if sftp $ssh_opts -b "$batch" "$REMOTE_USER@$REMOTE_HOST" >>"$LOG_FILE" 2>&1; then
                 log "Remote sync OK (sftp -> $REMOTE_HOST:$rpath/$TODAY)"
-                report "Remote sync OK (sftp -> $REMOTE_HOST:$rpath/$TODAY)"
+                REMOTE_RESULT="OK"
                 rm -f "$batch"
             else
                 rm -f "$batch"
-                fail "sftp to $REMOTE_HOST failed (see $LOG_FILE)."
+                fail "Slanje na vanjski backup server nije uspjelo (detalji: $LOG_FILE)."
                 return 1
             fi ;;
         *)  fail "Unknown REMOTE_METHOD: $REMOTE_METHOD" ; return 1 ;;
@@ -530,7 +534,7 @@ archive_folders() {
     [ "$ENCRYPT_ENABLED" = "yes" ] && aext="tar.gz.gpg"
     for d in $ARCHIVE_DIRS; do
         if [ ! -d "$d" ]; then
-            warn "Archive folder '$d' does not exist - skipped."
+            warn "Folder za arhivu '$d' ne postoji - preskočen."
             continue
         fi
         name="$(echo "${d#/}" | tr '/' '-')"
@@ -540,10 +544,10 @@ archive_folders() {
         # tar exit 1 = "file changed while reading" - acceptable for live dirs
         if [ "$rc" -le 1 ] && finalize_dump "$out.tmp" "$out"; then
             log "Folder archive OK: $d -> $(basename "$out")"
-            report "  OK   $d -> $(basename "$out") ($(du -h "$out" | cut -f1))"
+            report "  OK   $d ($(du -h "$out" | cut -f1))"
         else
             rm -f "$out.tmp"
-            fail "Folder archive FAILED for '$d'."
+            fail "Arhiva foldera '$d' nije uspjela."
         fi
     done
 }
@@ -553,11 +557,11 @@ archive_folders() {
 folders_mirror() {
     [ "$FOLDERS_ENABLED" = "yes" ] || return 0
     if [ "$REMOTE_ENABLED" != "yes" ] || [ "$REMOTE_METHOD" != "rsync" ]; then
-        warn "Folder mirror requires remote rsync - skipped."
+        warn "Sync foldera zahtijeva remote rsync - preskočen."
         return 1
     fi
     if [ ! -f "$FOLDERS_FILE" ]; then
-        warn "Folder mirror enabled but $FOLDERS_FILE is missing."
+        warn "Sync foldera je uključen, ali $FOLDERS_FILE ne postoji."
         return 1
     fi
     local ssh_opts rbase dirs=() dir name size_mb ex_opt=() scaffold
@@ -569,7 +573,7 @@ folders_mirror() {
         dirs+=("$dir")
     done < "$FOLDERS_FILE"
     if [ "${#dirs[@]}" -eq 0 ]; then
-        warn "Folder mirror enabled but $FOLDERS_FILE lists no folders."
+        warn "Sync foldera je uključen, ali $FOLDERS_FILE nema niti jedan folder."
         return 1
     fi
     [ -f "$FOLDER_EXCLUDES_FILE" ] && ex_opt=(--exclude-from="$FOLDER_EXCLUDES_FILE")
@@ -588,24 +592,28 @@ folders_mirror() {
     # the explicit FOLDERS_DELETE=yes opt-in; default is add/update only.
     local del_opt=()
     [ "$FOLDERS_DELETE" = "yes" ] && del_opt=(--delete)
-    report "Folder mirror -> $REMOTE_HOST:$rbase/folders (no local copy, delete=${FOLDERS_DELETE})"
+    report "Podaci (sync na vanjski backup server, bez brisanja):"
     for dir in "${dirs[@]}"; do
         if [ ! -d "$dir" ]; then
-            warn "Mirror folder '$dir' does not exist - skipped."
+            warn "Folder za sync '$dir' ne postoji - preskočen."
             continue
         fi
         name="$(echo "${dir#/}" | tr '/' '-')"
         size_mb="$(du -sm "$dir" 2>/dev/null | cut -f1)"
         if [ "${size_mb:-0}" -gt $((FOLDERS_MAX_GB * 1024)) ]; then
-            warn "Folder '$dir' is ${size_mb} MB (limit FOLDERS_MAX_GB=${FOLDERS_MAX_GB} GB) - check what grew."
+            warn "Folder '$dir' ima ${size_mb} MB (limit ${FOLDERS_MAX_GB} GB) - provjeriti što je naraslo."
         fi
         # shellcheck disable=SC2086
         if rsync -az "${del_opt[@]}" "${ex_opt[@]}" $RSYNC_EXTRA_OPTS -e "ssh $ssh_opts" \
             "$dir/" "$REMOTE_USER@$REMOTE_HOST:$rbase/folders/$name/" >>"$LOG_FILE" 2>&1; then
             log "Folder mirror OK: $dir (${size_mb} MB)"
-            report "  OK   $dir (${size_mb} MB) -> folders/$name/"
+            if [ "$size_mb" -ge 1024 ]; then
+                report "  OK   $dir ($((size_mb / 1024)).$(( (size_mb % 1024) * 10 / 1024 )) GB)"
+            else
+                report "  OK   $dir (${size_mb} MB)"
+            fi
         else
-            fail "Folder mirror FAILED for '$dir' (see $LOG_FILE)."
+            fail "Sync foldera '$dir' nije uspio (detalji: $LOG_FILE)."
         fi
     done
 }
@@ -736,7 +744,7 @@ cmd_restore() {
 # the morning mail doubles as a monitoring report.
 health_check() {
     [ "$HEALTH_ENABLED" = "yes" ] || return 0
-    report "Service health:"
+    report "Provjera servisa:"
     local engine svc ok services="" url code
     engine="$(detect_engine)"
 
@@ -746,12 +754,12 @@ health_check() {
             for svc in mysql mysqld mariadb; do
                 systemctl is-active --quiet "$svc" 2>/dev/null && { ok=yes; break; }
             done
-            if [ "$ok" = "yes" ]; then report "  OK   database ($svc active)"
-            else fail "Health: MySQL/MariaDB service is DOWN!"; fi ;;
+            if [ "$ok" = "yes" ]; then report "  OK   baza podataka ($svc)"
+            else fail "Servis baze (MySQL/MariaDB) NE RADI!"; fi ;;
         postgresql)
             if systemctl is-active --quiet postgresql 2>/dev/null; then
-                report "  OK   database (postgresql active)"
-            else fail "Health: PostgreSQL service is DOWN!"; fi ;;
+                report "  OK   baza podataka (postgresql)"
+            else fail "Servis baze (PostgreSQL) NE RADI!"; fi ;;
     esac
 
     if [ "$HEALTH_SERVICES" = "auto" ]; then
@@ -763,9 +771,9 @@ health_check() {
     fi
     for svc in $services; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            report "  OK   $svc active"
+            report "  OK   $svc"
         else
-            fail "Health: service '$svc' is NOT running!"
+            fail "Servis '$svc' NE RADI!"
         fi
     done
 
@@ -773,7 +781,7 @@ health_check() {
         code="$(curl -ksL -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)"
         case "$code" in
             2*|3*) report "  OK   $url (HTTP $code)" ;;
-            *)     fail "Health: $url returned HTTP ${code:-000}!" ;;
+            *)     fail "Stranica $url vratila HTTP ${code:-000}!" ;;
         esac
     done
 }
@@ -781,13 +789,13 @@ health_check() {
 # Standalone 'slbck health' - prints the result, mails only on failure
 cmd_health() {
     need_root
-    REPORT="SLBCK health check - $HOSTNAME_FQDN ($(date '+%F %T'))"$'\n\n'
+    REPORT="SLBCK provjera servisa - $HOST_SHORT ($(date '+%F %T'))"$'\n\n'
     ERRORS=0; WARNINGS=0
     HEALTH_ENABLED="yes"
     health_check
     printf '%s\n' "$REPORT"
     if [ "$ERRORS" -gt 0 ]; then
-        send_mail "[SLBCK] HEALTH ERROR on $HOSTNAME_FQDN" "$REPORT"
+        send_mail "[SLBCK] $HOST_SHORT HEALTH ERROR - $(date '+%F %H:%M')" "$REPORT"
         return 1
     fi
 }
@@ -802,26 +810,26 @@ verify_run() {
     engine="$(detect_engine)"
     dir="$(ls -1d "$BACKUP_DIR"/????-??-?? 2>/dev/null | tail -1)"
     if [ -z "$dir" ]; then
-        fail "Verify: no backups found in $BACKUP_DIR."
+        fail "Restore test: nema backupa u $BACKUP_DIR."
         return 1
     fi
     day="$(basename "$dir")"
-    report "Restore test (backup day: $day)"
+    report "Restore test (backup: $day):"
     gpg_check || return 1
 
     for f in "$dir"/*.sql.gz* "$dir"/*.tar.gz*; do
         [ -f "$f" ] || continue
         files+=("$f")
         if ! integrity_test "$f"; then
-            fail "Verify: archive integrity FAILED for $(basename "$f")"
+            fail "Restore test: arhiva $(basename "$f") NE PROLAZI provjeru integriteta!"
             bad=$((bad+1))
         fi
     done
     if [ "${#files[@]}" -eq 0 ]; then
-        fail "Verify: no dump files in $dir."
+        fail "Restore test: nema dump datoteka u $dir."
         return 1
     fi
-    report "  Archive integrity: $(( ${#files[@]} - bad ))/${#files[@]} OK"
+    report "  Integritet arhiva: $(( ${#files[@]} - bad ))/${#files[@]} OK"
 
     # pick the smallest real dump for the restore test (fast); skip _globals
     # and the system 'mysql' DB - prefer an application database
@@ -841,7 +849,7 @@ verify_run() {
         done
     fi
     if [ -z "$pick" ]; then
-        warn "Verify: no database dump suitable for a restore test."
+        warn "Restore test: nema prikladne baze za test."
         return 1
     fi
 
@@ -860,7 +868,7 @@ verify_run() {
             mysql_cmd -e "DROP DATABASE IF EXISTS \`$vdb\`" 2>>"$LOG_FILE"
             mysql_auth_cleanup
             if [ "${rc[0]}" -ne 0 ] || [ "${rc[2]}" -ne 0 ] || [ -z "$tables" ] || [ "$tables" -eq 0 ]; then
-                fail "Verify: restore test FAILED for '$dbname' (tables restored: ${tables:-0})."
+                fail "Restore test baze '$dbname' NIJE USPIO (vraćeno tablica: ${tables:-0})."
                 return 1
             fi ;;
         postgresql)
@@ -874,30 +882,30 @@ verify_run() {
                 "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')" 2>/dev/null)"
             run_as_postgres psql -d postgres -c "DROP DATABASE IF EXISTS $vdb" >/dev/null 2>>"$LOG_FILE"
             if [ "${prc[0]}" -ne 0 ] || [ "${prc[2]}" -ne 0 ] || [ -z "$tables" ] || [ "$tables" -eq 0 ]; then
-                fail "Verify: restore test FAILED for '$dbname' (tables restored: ${tables:-0})."
+                fail "Restore test baze '$dbname' NIJE USPIO (vraćeno tablica: ${tables:-0})."
                 return 1
             fi ;;
-        *)  fail "Verify: no supported database engine found."; return 1 ;;
+        *)  fail "Restore test: nema podržanog database enginea."; return 1 ;;
     esac
 
     log "Verify OK: '$dbname' restored into temp DB, $tables tables."
-    report "  Restore test: OK - '$dbname' restored into temp DB ($tables tables), temp DB dropped."
+    report "  OK   baza '$dbname' vraćena u testnu bazu ($tables tablica), testna baza obrisana"
     [ "$bad" -eq 0 ]
 }
 
 # Standalone 'slbck verify' - always sends a confirmation mail
 cmd_verify() {
     need_root
-    REPORT="SLBCK restore test - $HOSTNAME_FQDN"$'\n'"Started: $(date '+%F %T')"$'\n\n'
+    REPORT="SLBCK restore test - $HOST_SHORT ($(date '+%F %T'))"$'\n\n'
     ERRORS=0; WARNINGS=0
     verify_run
     local subject
     if [ "$ERRORS" -eq 0 ]; then
-        subject="[SLBCK] VERIFY OK - restore test on $HOSTNAME_FQDN"
+        subject="[SLBCK] $HOST_SHORT restore test OK - $(date '+%F %H:%M')"
     else
-        subject="[SLBCK] VERIFY ERROR - restore test on $HOSTNAME_FQDN"
+        subject="[SLBCK] $HOST_SHORT restore test ERROR - $(date '+%F %H:%M')"
     fi
-    REPORT="${REPORT}"$'\n'"Finished: $(date '+%F %T')"$'\n'
+    REPORT="${REPORT}"$'\n'"--"$'\n'"Backup by Saguaro :)"
     send_mail "$subject" "$REPORT"
     echo "----------------------------------------"
     printf '%s\n' "$REPORT"
@@ -929,22 +937,21 @@ cmd_backup() {
         exit 1
     fi
 
-    local start engine dest db size ext count=0
+    local start engine dest db size ext count=0 engine_label
     ext="$(dump_ext)"
+    START_EPOCH="$(date +%s)"
     start="$(date '+%F %T')"
     log "===== SLBCK backup started on $HOSTNAME_FQDN ====="
-    report "SLBCK backup report - $HOSTNAME_FQDN"
-    report "Started: $start"
-    report ""
 
     engine="$(detect_engine)"
     if ! service_check "$engine"; then
         finish_backup "$engine"
         return 1
     fi
-    report "Engine: $engine (service running)"
-    [ "$ENCRYPT_ENABLED" = "yes" ] && report "Encryption: GPG AES256 enabled"
-    report ""
+    case "$engine" in
+        mysql) engine_label="MySQL/MariaDB" ;;
+        *)     engine_label="PostgreSQL" ;;
+    esac
 
     if ! gpg_check; then
         finish_backup "$engine"
@@ -964,13 +971,14 @@ cmd_backup() {
     mkdir -p "$dest"
     chmod 700 "$BACKUP_DIR" "$dest"
 
+    report "Baze ($engine_label):"
     local dbs=""
     case "$engine" in
         mysql)
             mysql_auth_setup
             dbs="$(mysql_list_dbs)"
             if [ -z "$dbs" ]; then
-                fail "Could not list MySQL databases (check credentials / socket auth)."
+                fail "Ne mogu dohvatiti popis baza (provjeriti pristup/socket auth)."
             fi
             for db in $dbs; do
                 if mysql_dump_db "$db" "$dest/${db}.${ext}"; then
@@ -980,20 +988,20 @@ cmd_backup() {
                     sanity_check_size "$db" "$dest/${db}.${ext}"
                     count=$((count+1))
                 else
-                    fail "Dump failed for database: $db"
+                    fail "Dump baze '$db' nije uspio."
                 fi
             done
             mysql_auth_cleanup ;;
         postgresql)
             dbs="$(pg_list_dbs)"
             if [ -z "$dbs" ]; then
-                fail "Could not list PostgreSQL databases."
+                fail "Ne mogu dohvatiti popis PostgreSQL baza."
             fi
             if pg_dump_globals "$dest/_globals.${ext}"; then
                 log "Dumped PostgreSQL globals (roles/tablespaces)"
-                report "  OK   _globals (roles/tablespaces)"
+                report "  OK   _globals (role/tablespaceovi)"
             else
-                fail "Dump of PostgreSQL globals failed."
+                fail "Dump PostgreSQL globals nije uspio."
             fi
             for db in $dbs; do
                 if pg_dump_db "$db" "$dest/${db}.${ext}"; then
@@ -1003,26 +1011,22 @@ cmd_backup() {
                     sanity_check_size "$db" "$dest/${db}.${ext}"
                     count=$((count+1))
                 else
-                    fail "Dump failed for database: $db"
+                    fail "Dump baze '$db' nije uspio."
                 fi
             done ;;
     esac
+    report "  Ukupno: $count baza ($(du -ch "$dest"/*.sql.gz* 2>/dev/null | tail -1 | cut -f1))"
 
     if [ -n "$ARCHIVE_DIRS" ]; then
         report ""
-        report "Folder archives (daily, stored with DB dumps):"
+        report "Konfiguracija (dnevna arhiva uz baze):"
         archive_folders "$dest"
     fi
 
-    report ""
-    report "Databases dumped: $count"
-    report "Local folder: $dest ($(du -sh "$dest" 2>/dev/null | cut -f1))"
-    report ""
-
     # weekly automatic restore test (result goes into the same mail)
     if [ "$VERIFY_ENABLED" = "yes" ] && [ "$(date +%u)" = "$VERIFY_DAY" ] && [ "$count" -gt 0 ]; then
-        verify_run
         report ""
+        verify_run
     fi
 
     apply_retention
@@ -1032,42 +1036,58 @@ cmd_backup() {
         folders_mirror
     fi
 
+    report ""
+    report "Pohrana:"
+    report "  Lokalno:  $dest (čuva se zadnjih $RETENTION_DAYS dana)"
+    if [ "$REMOTE_ENABLED" = "yes" ]; then
+        report "  Vanjski backup server: ${REMOTE_RESULT:-GREŠKA}"
+    else
+        report "  Vanjski backup server: NIJE KONFIGURIRAN - backup postoji samo na ovom serveru!"
+    fi
+
     if [ "$HEALTH_ENABLED" = "yes" ]; then
         report ""
         health_check
-    fi
-
-    # Make it explicit in the mail WHERE the backups ended up
-    report ""
-    if [ "$REMOTE_ENABLED" = "yes" ]; then
-        report "Storage: local ($dest) + remote copy ($REMOTE_METHOD -> $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH)"
-    else
-        report "Storage: LOCAL ONLY - no remote location configured."
-        report "Backups exist only on this server: $dest"
     fi
 
     finish_backup "$engine"
 }
 
 finish_backup() {
-    local subject
-    report ""
-    report "Finished: $(date '+%F %T')"
-    local scope="local+remote"
-    [ "$REMOTE_ENABLED" != "yes" ] && scope="local-only"
+    local subject status_line header dur dur_str end_hm start_hm
+    dur=$(( $(date +%s) - START_EPOCH ))
+    dur_str="$((dur / 60))m $((dur % 60))s"
+    start_hm="$(date -d "@$START_EPOCH" '+%H:%M' 2>/dev/null || echo '?')"
+    end_hm="$(date '+%H:%M')"
+
     if [ "$ERRORS" -eq 0 ]; then
+        status_line="STATUS: OK ($ERRORS grešaka, $WARNINGS upozorenja)"
         if [ "$WARNINGS" -gt 0 ]; then
-            subject="[SLBCK] OK with $WARNINGS warning(s) - backup on $HOSTNAME_FQDN ($TODAY) [$scope]"
+            subject="[SLBCK] $HOST_SHORT backup OK ($WARNINGS upozorenja) - $(date '+%F %H:%M')"
         else
-            subject="[SLBCK] OK - backup on $HOSTNAME_FQDN ($TODAY) [$scope]"
+            subject="[SLBCK] $HOST_SHORT backup OK - $(date '+%F %H:%M')"
         fi
+    else
+        status_line="STATUS: GREŠKA ($ERRORS grešaka, $WARNINGS upozorenja)"
+        subject="[SLBCK] $HOST_SHORT backup ERROR - $(date '+%F %H:%M')"
+    fi
+
+    header="SLBCK backup izvještaj"$'\n'
+    header+="======================================"$'\n'
+    [ -n "$OWNER" ] && header+="Klijent: $OWNER"$'\n'
+    header+="Server:  $HOST_SHORT"$'\n'
+    header+="Datum:   $TODAY $start_hm -> $end_hm (trajanje: $dur_str)"$'\n\n'
+    header+="$status_line"$'\n\n'
+
+    REPORT="${header}${REPORT}"$'\n'"Log: $LOG_FILE"$'\n'"--"$'\n'"Backup by Saguaro :)"
+
+    if [ "$ERRORS" -eq 0 ]; then
         log "===== SLBCK backup finished OK ($WARNINGS warnings) ====="
         # warnings are always mailed, even with MAIL_ON=error
         if [ "$MAIL_ON" = "always" ] || [ "$WARNINGS" -gt 0 ]; then
             send_mail "$subject" "$REPORT"
         fi
     else
-        subject="[SLBCK] ERROR - backup on $HOSTNAME_FQDN ($TODAY) [$scope] - $ERRORS error(s)"
         log "===== SLBCK backup finished with $ERRORS error(s) ====="
         send_mail "$subject" "$REPORT"
         exit 1
@@ -1110,6 +1130,9 @@ write_config() {
     cat > "$CONFIG" <<EOF
 # SLBCK - SaguaroLocalBackup configuration
 # Generated by 'slbck setup' on $(date '+%F %T')
+
+# Customer/owner name - shown as "Klijent:" in the mail report
+OWNER="$OWNER"
 
 DB_ENGINE="$DB_ENGINE"
 BACKUP_DIR="$BACKUP_DIR"
@@ -1187,6 +1210,9 @@ cmd_setup() {
     echo " SLBCK - SaguaroLocalBackup setup (v$VERSION)"
     echo "=============================================="
     echo
+
+    ask "Owner/klijent (prikazuje se u mail izvještaju)" "$OWNER"
+    OWNER="$REPLY"
 
     local detected
     detected="$(detect_engine)"
@@ -1333,6 +1359,7 @@ cmd_status() {
     echo "----------------------------------------"
     if [ -f "$CONFIG" ]; then
         echo "Config:     $CONFIG"
+        echo "Owner:      ${OWNER:--}"
         echo "Engine:     $(detect_engine)"
         echo "Backup dir: $BACKUP_DIR ($(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1 || echo '-'))"
         echo "Retention:  last $RETENTION_DAYS days"
@@ -1471,8 +1498,8 @@ cmd_menu() {
             4) remote_send; ERRORS=0 ;;
             5) cmd_status ;;
             6) cmd_health; ERRORS=0; WARNINGS=0 ;;
-            7) send_mail "[SLBCK] Test mail from $HOSTNAME_FQDN" \
-                   "This is a SLBCK test mail. If you can read this, mail works." \
+            7) send_mail "[SLBCK] $HOST_SHORT test mail" \
+                   "Ovo je SLBCK testna poruka. Ako je čitaš, mail radi."$'\n'"--"$'\n'"Backup by Saguaro :)" \
                    && echo "Test mail sent to $MAIL_TO" ;;
             8) cmd_verify; ERRORS=0; WARNINGS=0 ;;
             9) cmd_update ;;
@@ -1506,8 +1533,8 @@ case "$CMD" in
     verify)    cmd_verify ;;
     update)    cmd_update ;;
     guide|upute) cmd_guide ;;
-    test-mail) send_mail "[SLBCK] Test mail from $HOSTNAME_FQDN" \
-                  "This is a SLBCK test mail. If you can read this, mail works." \
+    test-mail) send_mail "[SLBCK] $HOST_SHORT test mail" \
+                  "Ovo je SLBCK testna poruka. Ako je čitaš, mail radi."$'\n'"--"$'\n'"Backup by Saguaro :)" \
                   && echo "Test mail sent to $MAIL_TO" ;;
     version)   echo "SLBCK v$VERSION" ;;
     help|*)

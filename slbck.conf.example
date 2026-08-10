@@ -2,6 +2,9 @@
 # Location on server: /etc/slbck/slbck.conf (chmod 600)
 # Easiest way to configure: run 'slbck setup'
 
+# Customer/owner name - shown as "Klijent:" in the mail report
+OWNER=""
+
 # Database engine: auto | mysql | mariadb | postgresql
 # (mariadb uses the same toolchain as mysql - both are fully supported)
 DB_ENGINE="auto"
