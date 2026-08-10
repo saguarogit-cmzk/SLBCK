@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.6.0"
+VERSION="1.7.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -1353,6 +1353,87 @@ cmd_setup() {
     [ "$MAIL_ENABLED" = "yes" ] && echo "Test mail with:             slbck test-mail"
 }
 
+# ------------------------------------------------------------- quick setup --
+# CLOUD profile for mass rollout: fleet standards are fixed, only the
+# per-server answers are asked (~6 questions, 2 minutes per server).
+cmd_quick() {
+    need_root
+    echo "=============================================="
+    echo " SLBCK quick setup - CLOUD profil (v$VERSION)"
+    echo " Backup ide na Hetzner Storage Box (rsync, port 23)."
+    echo "=============================================="
+    echo "Standardi flote (fiksno): backup 02:00, retencija $RETENTION_DAYS dana,"
+    echo "arhiva /etc + cron + /usr/local/bin, sync foldera bez brisanja,"
+    echo "restore test nedjeljom, health check ukljucen, bez enkripcije."
+    echo
+
+    ask "Owner/klijent" "$OWNER";                                OWNER="$REPLY"
+    ask "Storage Box host (uXXXXXX.your-storagebox.de)" "$REMOTE_HOST"
+    REMOTE_HOST="$REPLY"
+    ask "Subaccount user (uXXXXXX-subN)" "$REMOTE_USER";         REMOTE_USER="$REPLY"
+    ask "Mail za izvjestaje (zarez za vise adresa)" "$MAIL_TO";  MAIL_TO="$REPLY"
+    ask "Health URL-ovi (razmak, prazno = bez)" "$HEALTH_URLS";  HEALTH_URLS="$REPLY"
+    ask "Folderi za sync na box (razmak, prazno = bez)" "/var/www"
+    local sync_dirs="$REPLY"
+    [ "$sync_dirs" = "none" ] && sync_dirs=""
+
+    # fleet standards - CLOUD profile
+    DB_ENGINE="auto"; CRON_HOUR="2"
+    ARCHIVE_DIRS="/etc /var/spool/cron /usr/local/bin"
+    MAIL_ENABLED="yes"; MAIL_ON="always"
+    VERIFY_ENABLED="yes"; VERIFY_DAY="7"
+    HEALTH_ENABLED="yes"; HEALTH_SERVICES="auto"
+    REMOTE_ENABLED="yes"; REMOTE_METHOD="rsync"; REMOTE_PORT="23"
+    REMOTE_PATH="."; REMOTE_SUBDIR=""; SSH_KEY=""
+    ENCRYPT_ENABLED="no"; ENCRYPT_PASSPHRASE=""
+    FOLDERS_DELETE="no"
+
+    if [ -n "$sync_dirs" ]; then
+        FOLDERS_ENABLED="yes"
+        {
+            echo "# SLBCK - folderi koji se syncaju na Storage Box (bez brisanja)"
+            local d
+            for d in $sync_dirs; do echo "$d"; done
+        } > "$FOLDERS_FILE"
+        chmod 600 "$FOLDERS_FILE"
+    else
+        FOLDERS_ENABLED="no"
+    fi
+    write_folder_templates >/dev/null
+    write_config
+    write_cron
+    mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+
+    # SSH key server -> box
+    if [ ! -f /root/.ssh/id_ed25519 ]; then
+        ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -C "root@$HOST_SHORT" >/dev/null
+        echo "Generiran SSH kljuc /root/.ssh/id_ed25519"
+    fi
+    echo
+    while :; do
+        if printf 'pwd\n' | sftp -P "$REMOTE_PORT" -o BatchMode=yes \
+             -o StrictHostKeyChecking=accept-new -b - \
+             "$REMOTE_USER@$REMOTE_HOST" >/dev/null 2>&1; then
+            echo "Veza na Storage Box: OK (kljuc radi)."
+            break
+        fi
+        echo "Kljuc jos NE radi na boxu. Instaliraj ga (treba lozinka subaccounta):"
+        echo
+        echo "  ssh-copy-id -p $REMOTE_PORT -s -i /root/.ssh/id_ed25519.pub $REMOTE_USER@$REMOTE_HOST"
+        echo
+        echo "Stariji ssh-copy-id (bez -s opcije, npr. Ubuntu 20.04):"
+        echo "  printf 'mkdir .ssh\\nput /root/.ssh/id_ed25519.pub .ssh/authorized_keys\\nchmod 600 .ssh/authorized_keys\\n' | sftp -P $REMOTE_PORT $REMOTE_USER@$REMOTE_HOST"
+        echo
+        read -r -p "Enter za ponovni test veze, 's' za preskoci: " a
+        [ "$a" = "s" ] && break
+    done
+
+    echo
+    echo "Quick setup gotov. Provjera:  slbck status"
+    ask "Pokrenuti prvi backup sada? (yes/no)" "yes"
+    [ "$REPLY" = "yes" ] && cmd_backup
+}
+
 # ------------------------------------------------------------------ status --
 cmd_status() {
     echo "SLBCK v$VERSION on $HOSTNAME_FQDN"
@@ -1396,7 +1477,9 @@ cmd_guide() {
 1) INSTALACIJA (na svakom serveru)
    git clone https://github.com/saguarogit-cmzk/SLBCK.git
    cd SLBCK && sudo ./install.sh
-   sudo slbck-setup            # otvara glavni izbornik
+   sudo slbck quick            # CLOUD profil: ~6 pitanja, ostalo automatski
+   (sudo slbck-setup = puni izbornik; slbck setup = detaljni wizard)
+   Puna dokumentacija: docs/INSTALACIJA.md, docs/RESTORE.md u repou
 
 2) POSTAVLJANJE (izbornik -> 1 Setup)
    Carobnjak pita redom:
@@ -1480,6 +1563,7 @@ cmd_menu() {
         echo " $HOSTNAME_FQDN | engine: $(detect_engine)"
         echo "=============================================="
         echo "  1) Setup / configuration (config + cron)"
+        echo "  c) Quick setup - CLOUD profil (novi server, ~6 pitanja)"
         echo "  2) Backup now"
         echo "  3) Restore a database"
         echo "  4) Send backups to remote server"
@@ -1493,6 +1577,7 @@ cmd_menu() {
         read -r -p "Choose: " choice
         case "$choice" in
             1) cmd_setup ;;
+            c|C) cmd_quick ;;
             2) cmd_backup ;;
             3) cmd_restore ;;
             4) remote_send; ERRORS=0 ;;
@@ -1523,6 +1608,7 @@ fi
 case "$CMD" in
     menu)      cmd_menu ;;
     setup)     cmd_setup ;;
+    quick)     cmd_quick ;;
     backup)    cmd_backup ;;
     restore)   cmd_restore ;;
     check)     need_root; service_check "$(detect_engine)" ;;
@@ -1544,6 +1630,7 @@ Usage: slbck <command>   (no command on a terminal = interactive menu)
        slbck-setup       (opens the interactive menu)
 
   menu        Interactive menu (setup, backup, restore, send, status...)
+  quick       Quick setup - CLOUD profil: fleet standards, ~6 questions
   setup       Setup wizard (config + cron, installs mail transport if missing)
   backup      Run backup now (check, dump all DBs, retention, remote, mail)
   restore     Interactive restore of one database (local or pulled from remote)

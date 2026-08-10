@@ -23,14 +23,25 @@ Ubuntuu, RHEL/Alma/Rocky i sličnima.
 10. Vrti se kao **cron job** u fiksno vrijeme (izbor 01:00–06:00), log se
     rotira kroz logrotate, disk se provjerava prije svakog backupa
 
+## Dokumentacija
+
+| Dokument | Za što |
+|---|---|
+| [docs/INSTALACIJA.md](docs/INSTALACIJA.md) | Onboarding novog servera (Robot + quick setup, checklist) |
+| [docs/RESTORE.md](docs/RESTORE.md) | Svi restore scenariji — od jedne tablice do potpunog DR-a |
+| [docs/BORG-MIGRACIJA.md](docs/BORG-MIGRACIJA.md) | Umirovljenje starog borg+S3 sustava po serveru |
+
 ## Instalacija
 
 ```bash
 git clone https://github.com/saguarogit-cmzk/SLBCK.git
 cd SLBCK
 sudo ./install.sh
-sudo slbck-setup
+sudo slbck quick       # CLOUD profil: ~6 pitanja, standardi flote automatski
 ```
+
+(`sudo slbck-setup` otvara puni izbornik; `slbck setup` je detaljni wizard
+sa svim opcijama — za nestandardne servere.)
 
 ## Izbornik
 
