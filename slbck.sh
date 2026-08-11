@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.9.0"
+VERSION="1.10.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -1239,6 +1239,14 @@ EOF
         chmod 600 "$FOLDERS_FILE"
         echo "Created $FOLDERS_FILE"
     fi
+    if [ ! -f "$FOLDERS_NAS_FILE" ]; then
+        cat > "$FOLDERS_NAS_FILE" <<'EOF'
+# SLBCK - folderi PREVELIKI za cloud: syncaju se SAMO na sekundarni NAS.
+# Jedan apsolutni path po retku. Restore: rsync natrag s NAS-a.
+#/home/data/veliki-arhiv
+EOF
+        chmod 600 "$FOLDERS_NAS_FILE"
+    fi
     if [ ! -f "$FOLDER_EXCLUDES_FILE" ]; then
         cat > "$FOLDER_EXCLUDES_FILE" <<'EOF'
 # SLBCK - rsync exclude patterns for folder mirror (one per line).
@@ -1723,6 +1731,95 @@ cmd_guide() {
 EOF
 }
 
+# --------------------------------------------------------------- edit menu --
+edit_file() {
+    local f="$1"
+    write_folder_templates >/dev/null 2>&1
+    echo "--- $f ---"
+    cat "$f" 2>/dev/null
+    echo "---"
+    read -r -p "Otvoriti u editoru? (yes/no) [yes]: " a
+    a="${a:-yes}"
+    if [ "$a" = "yes" ]; then
+        "${EDITOR:-$(command -v nano >/dev/null 2>&1 && echo nano || echo vi)}" "$f"
+        echo "Spremljeno: $f (vrijedi od sljedećeg backupa)"
+    fi
+}
+
+# Edit individual settings after install (NAS IP change, mail, folders...)
+cmd_edit() {
+    need_root
+    [ -f "$CONFIG" ] || { echo "Nema konfiguracije - prvo 'slbck quick' ili 'slbck setup'."; return 1; }
+    local ch
+    while :; do
+        echo
+        echo "----------------------------------------------"
+        echo " SLBCK - uredi postavke"
+        echo "----------------------------------------------"
+        echo "  1) Owner/klijent i mail"
+        echo "  2) Vanjski backup server (Storage Box)"
+        echo "  3) Sekundarni NAS (IP, user, path, scope)"
+        echo "  4) Folderi za sync na box       (folders.conf)"
+        echo "  5) NAS-only folderi             (folders-nas.conf)"
+        echo "  6) Excludovi za sync            (folder-excludes.conf)"
+        echo "  7) Health check (URL-ovi)"
+        echo "  8) Raspored (sat backupa, retencija)"
+        echo "  9) Prikaz konfiguracije (status)"
+        echo "  q) Natrag"
+        read -r -p "Odaberi: " ch
+        case "$ch" in
+            1)  ask "Owner/klijent" "$OWNER";                       OWNER="$REPLY"
+                ask "Mail to (zarez za više adresa)" "$MAIL_TO";    MAIL_TO="$REPLY"
+                ask "Mail from" "${MAIL_FROM:-slbck@$HOSTNAME_FQDN}"; MAIL_FROM="$REPLY"
+                ask "Mail on (always/error)" "$MAIL_ON";            MAIL_ON="$REPLY"
+                MAIL_ENABLED="yes"
+                write_config ;;
+            2)  ask "Remote uključen? (yes/no)" "$REMOTE_ENABLED";  REMOTE_ENABLED="$REPLY"
+                if [ "$REMOTE_ENABLED" = "yes" ]; then
+                    ask "Host" "$REMOTE_HOST";                      REMOTE_HOST="$REPLY"
+                    ask "Port" "$REMOTE_PORT";                      REMOTE_PORT="$REPLY"
+                    ask "User" "$REMOTE_USER";                      REMOTE_USER="$REPLY"
+                    ask "Path" "$REMOTE_PATH";                      REMOTE_PATH="$REPLY"
+                    ask "Subdir (auto/none/ime)" "${REMOTE_SUBDIR:-none}"
+                    REMOTE_SUBDIR="$REPLY"
+                    [ "$REMOTE_SUBDIR" = "none" ] && REMOTE_SUBDIR=""
+                fi
+                write_config ;;
+            3)  ask "Sekundarni NAS uključen? (yes/no)" "$SECONDARY_ENABLED"
+                SECONDARY_ENABLED="$REPLY"
+                if [ "$SECONDARY_ENABLED" = "yes" ]; then
+                    ask "NAS host/IP" "$SECONDARY_HOST";            SECONDARY_HOST="$REPLY"
+                    ask "NAS SSH port" "$SECONDARY_PORT";           SECONDARY_PORT="$REPLY"
+                    ask "NAS user" "$SECONDARY_USER";               SECONDARY_USER="$REPLY"
+                    ask "NAS path" "$SECONDARY_PATH";               SECONDARY_PATH="$REPLY"
+                    ask "Scope (db = samo dumpovi / all = + folderi)" "$SECONDARY_SCOPE"
+                    SECONDARY_SCOPE="$REPLY"
+                fi
+                write_config ;;
+            4)  edit_file "$FOLDERS_FILE" ;;
+            5)  edit_file "$FOLDERS_NAS_FILE" ;;
+            6)  edit_file "$FOLDER_EXCLUDES_FILE" ;;
+            7)  ask "Health uključen? (yes/no)" "$HEALTH_ENABLED";  HEALTH_ENABLED="$REPLY"
+                if [ "$HEALTH_ENABLED" = "yes" ]; then
+                    ask "URL-ovi (razmak, prazno = bez)" "$HEALTH_URLS"
+                    HEALTH_URLS="$REPLY"
+                fi
+                write_config ;;
+            8)  while :; do
+                    ask "Sat backupa (1-6)" "$CRON_HOUR"
+                    case "$REPLY" in [1-6]) CRON_HOUR="$REPLY"; break ;; *) echo "Unesi 1-6." ;; esac
+                done
+                ask "Retencija (dana lokalno)" "$RETENTION_DAYS"
+                RETENTION_DAYS="$REPLY"
+                write_config
+                write_cron ;;
+            9)  cmd_status ;;
+            q|Q) return 0 ;;
+            *)  echo "Nepoznata opcija." ;;
+        esac
+    done
+}
+
 # -------------------------------------------------------------------- menu --
 cmd_menu() {
     need_root
@@ -1734,6 +1831,7 @@ cmd_menu() {
         echo "=============================================="
         echo "  1) Setup / configuration (config + cron)"
         echo "  c) Quick setup - CLOUD profil (novi server, ~6 pitanja)"
+        echo "  e) Uredi postavke (NAS IP, mail, folderi, raspored...)"
         echo "  2) Backup now"
         echo "  3) Restore a database"
         echo "  4) Send backups to remote server"
@@ -1748,6 +1846,7 @@ cmd_menu() {
         case "$choice" in
             1) cmd_setup ;;
             c|C) cmd_quick ;;
+            e|E) cmd_edit ;;
             2) cmd_backup ;;
             3) cmd_restore ;;
             4) remote_send; ERRORS=0 ;;
@@ -1779,6 +1878,7 @@ case "$CMD" in
     menu)      cmd_menu ;;
     setup)     cmd_setup ;;
     quick)     cmd_quick ;;
+    edit)      cmd_edit ;;
     backup)    cmd_backup ;;
     restore)   cmd_restore ;;
     check)     need_root; service_check "$(detect_engine)" ;;
@@ -1801,6 +1901,7 @@ Usage: slbck <command>   (no command on a terminal = interactive menu)
 
   menu        Interactive menu (setup, backup, restore, send, status...)
   quick       Quick setup - CLOUD profil: fleet standards, ~6 questions
+  edit        Edit individual settings (NAS IP, mail, folders, schedule...)
   setup       Setup wizard (config + cron, installs mail transport if missing)
   backup      Run backup now (check, dump all DBs, retention, remote, mail)
   restore     Interactive restore of one database (local or pulled from remote)
