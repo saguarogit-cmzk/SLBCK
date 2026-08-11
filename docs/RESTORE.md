@@ -77,6 +77,17 @@ u tom trenutku. Kopiraj fajl van i vrati ga na server.
 > Puni restore snapshota kroz Robot briše sve novije snapshote — za
 > pojedinačne fajlove UVIJEK koristiti snapshot direktorij, ne restore.
 
+**NAS-only folderi** (`/etc/slbck/folders-nas.conf` — preveliki za cloud)
+vraćaju se sa Synologyja:
+
+```bash
+rsync -az slbck@NAS-IP:/volume1/backup/<server>/folders/<naziv>/ /original/path/
+```
+
+**Napomena za `vendor/`**: composer vendor folderi se NE backupiraju
+(reproducibilni su) — nakon restora aplikacije pokreni `composer install`
+u folderu aplikacije.
+
 ## 5. Konfiguracija servera (`/etc`, cron, skripte)
 
 ```bash

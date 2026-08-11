@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.8.0"
+VERSION="1.9.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -87,6 +87,8 @@ FOLDERS_DELETE="no"         # no  = SAFE sync: only add/update on remote, never 
                             #       deleted on remote too (snapshots keep history)
 FOLDERS_FILE="$CONFIG_DIR/folders.conf"
 FOLDER_EXCLUDES_FILE="$CONFIG_DIR/folder-excludes.conf"
+# Folders too big for the cloud: synced ONLY to the secondary NAS
+FOLDERS_NAS_FILE="$CONFIG_DIR/folders-nas.conf"
 
 [ -f "$CONFIG" ] && . "$CONFIG"
 
@@ -700,6 +702,45 @@ secondary_send() {
             fi
         done
     fi
+
+    # NAS-only folders (too big for the cloud) - from folders-nas.conf,
+    # synced whenever the secondary target is enabled
+    if [ -f "$FOLDERS_NAS_FILE" ]; then
+        local ndir nname nsize ndirs=() nex=() ndel=() nscaffold
+        [ -f "$FOLDER_EXCLUDES_FILE" ] && nex=(--exclude-from="$FOLDER_EXCLUDES_FILE")
+        [ "$FOLDERS_DELETE" = "yes" ] && ndel=(--delete)
+        while IFS= read -r ndir; do
+            case "$ndir" in ""|\#*) continue ;; esac
+            if [ ! -d "$ndir" ]; then
+                warn "NAS-only folder '$ndir' ne postoji - preskočen."
+                continue
+            fi
+            ndirs+=("$ndir")
+        done < "$FOLDERS_NAS_FILE"
+        if [ "${#ndirs[@]}" -gt 0 ]; then
+            nscaffold="$(mktemp -d /tmp/slbck.XXXXXX)"
+            for ndir in "${ndirs[@]}"; do
+                mkdir -p "$nscaffold/folders/$(echo "${ndir#/}" | tr '/' '-')"
+            done
+            rsync -a -e "ssh $ssh_opts" "$nscaffold/" \
+                "$SECONDARY_USER@$SECONDARY_HOST:$spath/" >>"$LOG_FILE" 2>&1
+            rm -rf "$nscaffold"
+            report ""
+            report "Podaci (samo NAS, preveliki za cloud):"
+            for ndir in "${ndirs[@]}"; do
+                nname="$(echo "${ndir#/}" | tr '/' '-')"
+                nsize="$(du -sm "$ndir" 2>/dev/null | cut -f1)"
+                # shellcheck disable=SC2086
+                if rsync -az "${ndel[@]}" "${nex[@]}" $RSYNC_EXTRA_OPTS -e "ssh $ssh_opts" \
+                    "$ndir/" "$SECONDARY_USER@$SECONDARY_HOST:$spath/folders/$nname/" >>"$LOG_FILE" 2>&1; then
+                    log "NAS-only folder sync OK: $ndir (${nsize} MB)"
+                    report "  OK   $ndir (${nsize} MB)"
+                else
+                    fail "NAS-only sync foldera '$ndir' nije uspio (detalji: $LOG_FILE)."
+                fi
+            done
+        fi
+    fi
 }
 
 # ----------------------------------------------------------------- restore --
@@ -1203,10 +1244,16 @@ EOF
 # SLBCK - rsync exclude patterns for folder mirror (one per line).
 # Applied to every mirrored folder.
 node_modules/
+vendor/
+sql_dump/
 .cache/
 cache/
 *.tmp
 *.swp
+storage/logs/
+storage/framework/cache/
+storage/framework/sessions/
+storage/framework/views/
 EOF
         chmod 600 "$FOLDER_EXCLUDES_FILE"
         echo "Created $FOLDER_EXCLUDES_FILE"
@@ -1432,6 +1479,15 @@ cmd_setup() {
         ask "NAS path (mora postojati)" "$SECONDARY_PATH"; SECONDARY_PATH="$REPLY"
         ask "Scope (db = samo dumpovi / all = + data folderi)" "$SECONDARY_SCOPE"
         SECONDARY_SCOPE="$REPLY"
+        if [ ! -f "$FOLDERS_NAS_FILE" ]; then
+            cat > "$FOLDERS_NAS_FILE" <<'EOF'
+# SLBCK - folderi PREVELIKI za cloud: syncaju se SAMO na sekundarni NAS.
+# Jedan apsolutni path po retku. Restore: rsync natrag s NAS-a.
+#/home/data/veliki-arhiv
+EOF
+            chmod 600 "$FOLDERS_NAS_FILE"
+            echo "Kreiran $FOLDERS_NAS_FILE (za foldere prevelike za cloud)."
+        fi
         echo "NOTE: SSH key auth prema NAS-u mora raditi (ssh-copy-id na NAS user)."
     fi
 

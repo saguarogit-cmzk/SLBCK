@@ -240,6 +240,10 @@ Za servere koji uz Storage Box vide i lokalni NAS (npr. Synology):
 dnevnih dumpova** na NAS preko rsync/SSH; `SECONDARY_SCOPE="all"` sinka i
 data foldere. U mailu: `Sekundarni backup (NAS): OK`.
 
+**Folderi preveliki za cloud**: upiši ih u `/etc/slbck/folders-nas.conf`
+(jedan path po retku) — syncaju se **samo na NAS**, nikad na Storage Box,
+s zasebnom sekcijom u mailu. Restore: rsync natrag s NAS-a.
+
 Synology priprema: Control Panel → uključiti **SSH** i **rsync** servis +
 **user home** servis (za authorized_keys), kreirati shared folder (npr.
 `/volume1/backup/slbck`) i usera s pravima na njega, pa `ssh-copy-id` sa
