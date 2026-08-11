@@ -233,6 +233,18 @@ rsync -az -e "ssh -p23" uXXXXX@uXXXXX.your-storagebox.de:backup/srv01/folders/va
 
 Starija verzija fajla → uzmi je iz snapshot direktorija Storage Boxa.
 
+## Sekundarni target (lokalni NAS — 3-2-1)
+
+Za servere koji uz Storage Box vide i lokalni NAS (npr. Synology):
+`SECONDARY_*` u configu (ili kroz `slbck setup`) šalje **drugu kopiju
+dnevnih dumpova** na NAS preko rsync/SSH; `SECONDARY_SCOPE="all"` sinka i
+data foldere. U mailu: `Sekundarni backup (NAS): OK`.
+
+Synology priprema: Control Panel → uključiti **SSH** i **rsync** servis +
+**user home** servis (za authorized_keys), kreirati shared folder (npr.
+`/volume1/backup/slbck`) i usera s pravima na njega, pa `ssh-copy-id` sa
+servera na tog usera.
+
 ## Remote kopija
 
 - **rsync**: mirrora cijeli lokalni backup folder → remote ima istu retenciju

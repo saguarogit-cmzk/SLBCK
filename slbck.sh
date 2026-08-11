@@ -14,7 +14,7 @@
 #   slbck status   - show config, cron, disk usage, last log lines
 #   slbck test-mail- send a test e-mail
 #
-VERSION="1.7.0"
+VERSION="1.8.0"
 set -u
 
 CONFIG_DIR="/etc/slbck"
@@ -47,6 +47,17 @@ REMOTE_SUBDIR=""
 SSH_KEY=""                  # optional private key path
 MYSQL_USER=""               # empty = socket auth (root)
 MYSQL_PASS=""
+
+# Secondary target (Phase 2): local NAS via rsync/SSH. Receives the daily
+# dump folders (DBs + config archives); with SCOPE=all also the data folders.
+SECONDARY_ENABLED="no"
+SECONDARY_HOST=""
+SECONDARY_PORT="22"
+SECONDARY_USER=""
+SECONDARY_PATH=""           # e.g. /volume1/backup/slbck (must exist on NAS)
+SECONDARY_SUBDIR="auto"     # auto = short hostname, empty = none, or custom
+SECONDARY_SSH_KEY=""
+SECONDARY_SCOPE="db"        # db = dumps+archives only | all = + data folders
 MIN_FREE_MB="500"           # abort backup if less than this (or 2x last backup) free
 ENCRYPT_ENABLED="no"        # yes = gpg AES256 symmetric encryption of dumps
 ENCRYPT_PASSPHRASE=""       # min 12 chars; ALSO STORE IT IN YOUR PASSWORD MANAGER
@@ -67,6 +78,8 @@ HEALTH_URLS=""              # space separated URLs, expect HTTP 2xx/3xx
 RSYNC_EXTRA_OPTS=""
 
 ARCHIVE_DIRS=""             # space separated, e.g. "/etc /root"
+# Patterns excluded from ARCHIVE tars (caches would bloat daily archives)
+ARCHIVE_EXCLUDES=".cache .nvm .npm .composer node_modules"
 FOLDERS_ENABLED="no"        # yes = mirror folders from folders.conf to remote
 FOLDERS_MAX_GB="50"         # warn in mail when a mirrored folder exceeds this
 FOLDERS_DELETE="no"         # no  = SAFE sync: only add/update on remote, never delete
@@ -85,6 +98,7 @@ ERRORS=0
 WARNINGS=0
 START_EPOCH=0
 REMOTE_RESULT=""
+SECONDARY_RESULT=""
 
 # ---------------------------------------------------------------- helpers ---
 log() {
@@ -539,7 +553,9 @@ archive_folders() {
         fi
         name="$(echo "${d#/}" | tr '/' '-')"
         out="$dest/_files-${name}.${aext}"
-        tar -C / -czf "$out.tmp" "${d#/}" 2>>"$LOG_FILE"
+        local exargs=() p
+        for p in $ARCHIVE_EXCLUDES; do exargs+=(--exclude="$p"); done
+        tar -C / "${exargs[@]}" -czf "$out.tmp" "${d#/}" 2>>"$LOG_FILE"
         rc=$?
         # tar exit 1 = "file changed while reading" - acceptable for live dirs
         if [ "$rc" -le 1 ] && finalize_dump "$out.tmp" "$out"; then
@@ -616,6 +632,74 @@ folders_mirror() {
             fail "Sync foldera '$dir' nije uspio (detalji: $LOG_FILE)."
         fi
     done
+}
+
+# --------------------------------------------------------------- secondary --
+# Phase 2: local NAS as a second copy (3-2-1). Mirrors the daily dump dirs;
+# with SECONDARY_SCOPE=all also syncs the data folders from folders.conf.
+secondary_ssh_opts() {
+    local o="-p $SECONDARY_PORT -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    o="$o -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+    [ -n "$SECONDARY_SSH_KEY" ] && o="$o -i $SECONDARY_SSH_KEY"
+    echo "$o"
+}
+
+secondary_full_path() {
+    case "$SECONDARY_SUBDIR" in
+        auto) echo "$SECONDARY_PATH/$(hostname -s)" ;;
+        "")   echo "$SECONDARY_PATH" ;;
+        *)    echo "$SECONDARY_PATH/$SECONDARY_SUBDIR" ;;
+    esac
+}
+
+secondary_send() {
+    [ "$SECONDARY_ENABLED" = "yes" ] || return 0
+    SECONDARY_RESULT="GREŠKA"
+    if [ -z "$SECONDARY_HOST" ] || [ -z "$SECONDARY_USER" ] || [ -z "$SECONDARY_PATH" ]; then
+        fail "Sekundarni backup je uključen, ali nije konfiguriran (host/user/path)."
+        return 1
+    fi
+    local ssh_opts spath
+    ssh_opts="$(secondary_ssh_opts)"
+    spath="$(secondary_full_path)"
+    # shellcheck disable=SC2086
+    if rsync -az --delete --exclude='/folders' --exclude='/.ssh' --exclude='/.zfs' \
+        $RSYNC_EXTRA_OPTS -e "ssh $ssh_opts" \
+        "$BACKUP_DIR/" "$SECONDARY_USER@$SECONDARY_HOST:$spath/" >>"$LOG_FILE" 2>&1; then
+        log "Secondary sync OK (rsync -> $SECONDARY_HOST:$spath)"
+        SECONDARY_RESULT="OK"
+    else
+        fail "Slanje na sekundarni backup (NAS) nije uspjelo (detalji: $LOG_FILE)."
+        return 1
+    fi
+
+    if [ "$SECONDARY_SCOPE" = "all" ] && [ "$FOLDERS_ENABLED" = "yes" ] && [ -f "$FOLDERS_FILE" ]; then
+        local dir name ex_opt=() del_opt=() scaffold dirs=()
+        [ -f "$FOLDER_EXCLUDES_FILE" ] && ex_opt=(--exclude-from="$FOLDER_EXCLUDES_FILE")
+        [ "$FOLDERS_DELETE" = "yes" ] && del_opt=(--delete)
+        while IFS= read -r dir; do
+            case "$dir" in ""|\#*) continue ;; esac
+            [ -d "$dir" ] && dirs+=("$dir")
+        done < "$FOLDERS_FILE"
+        [ "${#dirs[@]}" -gt 0 ] || return 0
+        scaffold="$(mktemp -d /tmp/slbck.XXXXXX)"
+        for dir in "${dirs[@]}"; do
+            mkdir -p "$scaffold/folders/$(echo "${dir#/}" | tr '/' '-')"
+        done
+        rsync -a -e "ssh $ssh_opts" "$scaffold/" \
+            "$SECONDARY_USER@$SECONDARY_HOST:$spath/" >>"$LOG_FILE" 2>&1
+        rm -rf "$scaffold"
+        for dir in "${dirs[@]}"; do
+            name="$(echo "${dir#/}" | tr '/' '-')"
+            # shellcheck disable=SC2086
+            if rsync -az "${del_opt[@]}" "${ex_opt[@]}" $RSYNC_EXTRA_OPTS -e "ssh $ssh_opts" \
+                "$dir/" "$SECONDARY_USER@$SECONDARY_HOST:$spath/folders/$name/" >>"$LOG_FILE" 2>&1; then
+                log "Secondary folder sync OK: $dir"
+            else
+                warn "Sekundarni sync foldera '$dir' nije uspio (detalji: $LOG_FILE)."
+            fi
+        done
+    fi
 }
 
 # ----------------------------------------------------------------- restore --
@@ -1035,6 +1119,7 @@ cmd_backup() {
         report ""
         folders_mirror
     fi
+    secondary_send
 
     report ""
     report "Pohrana:"
@@ -1043,6 +1128,9 @@ cmd_backup() {
         report "  Vanjski backup server: ${REMOTE_RESULT:-GREŠKA}"
     else
         report "  Vanjski backup server: NIJE KONFIGURIRAN - backup postoji samo na ovom serveru!"
+    fi
+    if [ "$SECONDARY_ENABLED" = "yes" ]; then
+        report "  Sekundarni backup (NAS): ${SECONDARY_RESULT:-GREŠKA}"
     fi
 
     if [ "$HEALTH_ENABLED" = "yes" ]; then
@@ -1160,6 +1248,7 @@ RSYNC_EXTRA_OPTS="$RSYNC_EXTRA_OPTS"
 # Folder backup: archive = daily tar.gz with the DB dumps;
 # mirror = folders from $FOLDERS_FILE rsynced directly to remote
 ARCHIVE_DIRS="$ARCHIVE_DIRS"
+ARCHIVE_EXCLUDES="$ARCHIVE_EXCLUDES"
 FOLDERS_ENABLED="$FOLDERS_ENABLED"
 FOLDERS_MAX_GB="$FOLDERS_MAX_GB"
 # no = safe sync (only add/update on remote), yes = true mirror with deletes
@@ -1182,6 +1271,16 @@ SSH_KEY="$SSH_KEY"
 # MySQL credentials - leave empty to use socket auth as root (recommended)
 MYSQL_USER="$MYSQL_USER"
 MYSQL_PASS="$MYSQL_PASS"
+
+# Secondary target (local NAS via rsync/SSH)
+SECONDARY_ENABLED="$SECONDARY_ENABLED"
+SECONDARY_HOST="$SECONDARY_HOST"
+SECONDARY_PORT="$SECONDARY_PORT"
+SECONDARY_USER="$SECONDARY_USER"
+SECONDARY_PATH="$SECONDARY_PATH"
+SECONDARY_SUBDIR="$SECONDARY_SUBDIR"
+SECONDARY_SSH_KEY="$SECONDARY_SSH_KEY"
+SECONDARY_SCOPE="$SECONDARY_SCOPE"
 EOF
     chmod 600 "$CONFIG"
     echo "Config written to $CONFIG"
@@ -1323,6 +1422,20 @@ cmd_setup() {
     fi
 
     echo
+    echo "Sekundarni backup (lokalni NAS preko rsync/SSH) - druga kopija dumpova:"
+    ask "Secondary NAS target? (yes/no)" "$SECONDARY_ENABLED"
+    SECONDARY_ENABLED="$REPLY"
+    if [ "$SECONDARY_ENABLED" = "yes" ]; then
+        ask "NAS host/IP" "$SECONDARY_HOST";              SECONDARY_HOST="$REPLY"
+        ask "NAS SSH port" "$SECONDARY_PORT";             SECONDARY_PORT="$REPLY"
+        ask "NAS user" "$SECONDARY_USER";                 SECONDARY_USER="$REPLY"
+        ask "NAS path (mora postojati)" "$SECONDARY_PATH"; SECONDARY_PATH="$REPLY"
+        ask "Scope (db = samo dumpovi / all = + data folderi)" "$SECONDARY_SCOPE"
+        SECONDARY_SCOPE="$REPLY"
+        echo "NOTE: SSH key auth prema NAS-u mora raditi (ssh-copy-id na NAS user)."
+    fi
+
+    echo
     echo "Folder backup:"
     echo " - ARCHIVE: small folders (e.g. /etc) get a daily tar.gz stored with"
     echo "   the DB dumps - same retention, mirror, encryption and verify."
@@ -1451,6 +1564,7 @@ cmd_status() {
         echo "Archives:   ${ARCHIVE_DIRS:-none}"
         echo "Mirror:     $FOLDERS_ENABLED ($FOLDERS_FILE, warn > ${FOLDERS_MAX_GB} GB)"
         echo "Remote:     $REMOTE_ENABLED ($REMOTE_METHOD $REMOTE_USER@$REMOTE_HOST:$(remote_full_path))"
+        echo "Secondary:  $SECONDARY_ENABLED ($SECONDARY_USER@$SECONDARY_HOST:$(secondary_full_path 2>/dev/null), scope=$SECONDARY_SCOPE)"
     else
         echo "Not configured yet - run: slbck setup"
     fi
@@ -1613,7 +1727,7 @@ case "$CMD" in
     restore)   cmd_restore ;;
     check)     need_root; service_check "$(detect_engine)" ;;
     health)    cmd_health ;;
-    send)      need_root; remote_send; [ "$ERRORS" -eq 0 ] || exit 1 ;;
+    send)      need_root; remote_send; secondary_send; [ "$ERRORS" -eq 0 ] || exit 1 ;;
     pull)      need_root; remote_pull ;;
     status)    cmd_status ;;
     verify)    cmd_verify ;;

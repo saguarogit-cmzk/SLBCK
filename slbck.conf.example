@@ -100,6 +100,22 @@ REMOTE_SUBDIR=""
 # work non-interactively (ssh-copy-id) - SLBCK never stores SSH passwords.
 SSH_KEY=""
 
+# --- Secondary target: local NAS via rsync/SSH (3-2-1) ----------------------
+# Second copy of the daily dump folders; SCOPE=all also syncs data folders.
+# SSH key auth to the NAS must work (Synology: enable SSH + rsync service,
+# user home service for authorized_keys; path e.g. /volume1/backup/slbck).
+SECONDARY_ENABLED="no"
+SECONDARY_HOST=""
+SECONDARY_PORT="22"
+SECONDARY_USER=""
+SECONDARY_PATH=""
+SECONDARY_SUBDIR="auto"     # auto = hostname subfolder
+SECONDARY_SSH_KEY=""
+SECONDARY_SCOPE="db"        # db | all
+
+# Patterns excluded from daily ARCHIVE tars (caches bloat archives)
+ARCHIVE_EXCLUDES=".cache .nvm .npm .composer node_modules"
+
 # --- MySQL credentials -----------------------------------------------------
 # Leave empty to use unix socket auth as root (default on Debian/Ubuntu/MariaDB).
 # Otherwise create a dedicated backup user, e.g.:
